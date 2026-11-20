@@ -138,6 +138,8 @@ static TsCompiler *ts__CompilerCreate(void)
     ts__hashSet(&compiler->builtin_function_table, "trunc", (void *)AST_BUILTIN_FUNC_TRUNC);
     ts__hashSet(&compiler->builtin_function_table, "ceil", (void *)AST_BUILTIN_FUNC_CEIL);
     ts__hashSet(&compiler->builtin_function_table, "floor", (void *)AST_BUILTIN_FUNC_FLOOR);
+    ts__hashSet(&compiler->builtin_function_table, "round", (void *)AST_BUILTIN_FUNC_ROUND);
+    ts__hashSet(&compiler->builtin_function_table, "sign", (void *)AST_BUILTIN_FUNC_SIGN);
     ts__hashSet(&compiler->builtin_function_table, "lerp", (void *)AST_BUILTIN_FUNC_LERP);
     ts__hashSet(&compiler->builtin_function_table, "clamp", (void *)AST_BUILTIN_FUNC_CLAMP);
     ts__hashSet(&compiler->builtin_function_table, "step", (void *)AST_BUILTIN_FUNC_STEP);

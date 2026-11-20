@@ -1787,6 +1787,13 @@ ArrayOfAstDeclPtr ts__parse(TsCompiler *compiler, ArrayOfToken tokens)
 
     while (!parserIsAtEnd(p))
     {
+        // Stray semicolons are legal at top level (e.g. "cbuffer X { ... };")
+        if (parserPeek(p, 0)->kind == TOKEN_SEMICOLON)
+        {
+            parserNext(p, 1);
+            continue;
+        }
+
         AstDecl *decl = parseTopLevel(p);
         if (!decl)
         {

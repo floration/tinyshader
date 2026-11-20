@@ -1016,6 +1016,202 @@ static void tryCoerceExprToScalarType(Analyzer *a, AstExpr *expr, AstType *scala
 }
 
 static void analyzerAnalyzeExpr(Analyzer *a, AstExpr *expr, AstType *expected_type);
+
+//
+// Intrinsics that are expressible in terms of other HLSL constructs are
+// rewritten here, before analysis, so codegen doesn't need to know them.
+//
+static AstExpr *mkFloatLit(TsCompiler *compiler, Location loc, double value)
+{
+    Token *tok = NEW(compiler, Token);
+    tok->kind = TOKEN_FLOAT_LIT;
+    tok->loc = loc;
+    tok->double_ = value;
+
+    AstExpr *e = NEW(compiler, AstExpr);
+    e->kind = EXPR_PRIMARY;
+    e->loc = loc;
+    e->primary.token = tok;
+    return e;
+}
+
+static AstExpr *mkBinary(TsCompiler *compiler, Location loc, AstBinaryOp op, AstExpr *l, AstExpr *r)
+{
+    AstExpr *e = NEW(compiler, AstExpr);
+    e->kind = EXPR_BINARY;
+    e->loc = loc;
+    e->binary.op = op;
+    e->binary.left = l;
+    e->binary.right = r;
+    return e;
+}
+
+static void setCall(TsCompiler *compiler, AstExpr *e, const char *name, AstExpr **args, size_t count)
+{
+    AstExpr *func = NEW(compiler, AstExpr);
+    func->kind = EXPR_IDENT;
+    func->loc = e->loc;
+    func->ident.name = (char *)name;
+
+    ArrayOfAstExprPtr params = {0};
+    for (size_t i = 0; i < count; ++i) arrPush(compiler, &params, args[i]);
+
+    e->kind = EXPR_FUNC_CALL;
+    e->func_call.func_expr = func;
+    e->func_call.params = params;
+}
+
+static bool desugarIntrinsic(TsCompiler *compiler, AstExpr *expr)
+{
+    AstExpr *func_expr = expr->func_call.func_expr;
+    if (func_expr->kind != EXPR_IDENT) return false;
+
+    const char *name = func_expr->ident.name;
+    size_t n = arrLength(expr->func_call.params);
+    AstExpr **p = expr->func_call.params.ptr;
+    Location loc = expr->loc;
+
+    if (strcmp(name, "saturate") == 0 && n == 1)
+    {
+        AstExpr *args[3] = {p[0], mkFloatLit(compiler, loc, 0.0), mkFloatLit(compiler, loc, 1.0)};
+        setCall(compiler, expr, "clamp", args, 3);
+        return true;
+    }
+    if (strcmp(name, "mad") == 0 && n == 3)
+    {
+        AstExpr *mul = mkBinary(compiler, loc, BINOP_MUL, p[0], p[1]);
+        AstExpr *add = mkBinary(compiler, loc, BINOP_ADD, mul, p[2]);
+        *expr = *add;
+        return true;
+    }
+    if (strcmp(name, "rcp") == 0 && n == 1)
+    {
+        AstExpr *div = mkBinary(compiler, loc, BINOP_DIV, mkFloatLit(compiler, loc, 1.0), p[0]);
+        *expr = *div;
+        return true;
+    }
+    if (strcmp(name, "log10") == 0 && n == 1)
+    {
+        AstExpr *arg = p[0];
+        AstExpr *call = NEW(compiler, AstExpr);
+        call->loc = loc;
+        setCall(compiler, call, "log2", &arg, 1);
+        AstExpr *mul =
+            mkBinary(compiler, loc, BINOP_MUL, call, mkFloatLit(compiler, loc, 0.30102999566398120));
+        *expr = *mul;
+        return true;
+    }
+
+    return false;
+}
+
+
+// Wraps an already-analyzed expression in an implicit conversion to 'type'.
+static void wrapAutoCastM(TsCompiler *compiler, AstExpr *expr, AstType *type)
+{
+    if (!expr->type || expr->type == type) return;
+
+    AstExpr *sub_expr = NEW(compiler, AstExpr);
+    *sub_expr = *expr;
+
+    expr->kind = EXPR_AUTO_CAST;
+    expr->auto_cast.sub = sub_expr;
+    expr->type = type;
+    expr->assignable = false;
+    expr->resolved_int = NULL;
+}
+
+static void wrapAutoCast(Analyzer *a, AstExpr *expr, AstType *type)
+{
+    wrapAutoCastM(a->compiler, expr, type);
+}
+
+// HLSL usual arithmetic conversions for scalar element types:
+// any float beats any int, wider beats narrower, unsigned beats signed.
+static AstType *commonScalarType(AstType *x, AstType *y)
+{
+    if (!x) return y;
+    if (!y) return x;
+    if (x == y) return x;
+
+    if (x->kind == TYPE_FLOAT && y->kind != TYPE_FLOAT) return x;
+    if (y->kind == TYPE_FLOAT && x->kind != TYPE_FLOAT) return y;
+
+    if (x->kind == TYPE_FLOAT && y->kind == TYPE_FLOAT)
+    {
+        return (x->float_.bits >= y->float_.bits) ? x : y;
+    }
+
+    if (x->kind == TYPE_INT && y->kind == TYPE_INT)
+    {
+        if (x->int_.bits != y->int_.bits) return (x->int_.bits > y->int_.bits) ? x : y;
+        return x->int_.is_signed ? y : x;
+    }
+
+    return NULL;
+}
+
+// Makes the arguments of a component-wise intrinsic agree: scalars are
+// splatted to the widest vector argument and element types are promoted
+// (to float when force_float is set), as DXC does.
+static void unifyIntrinsicArgs(Analyzer *a, AstExpr **args, size_t count, bool force_float)
+{
+    Module *m = a->module;
+    uint32_t vec_size = 0;
+    AstType *common = force_float ? newFloatType(m, 32) : NULL;
+
+    for (size_t i = 0; i < count; ++i)
+    {
+        AstType *t = args[i]->type;
+        if (!t) return;
+        AstType *st = ts__getScalarType(t);
+        if (!st) return; // matrices, structs, etc.: leave to the existing checks
+        if (t->kind == TYPE_VECTOR && t->vector.size > vec_size) vec_size = t->vector.size;
+        common = commonScalarType(common, st);
+        if (!common) return;
+    }
+
+    AstType *target = vec_size ? newVectorType(m, common, vec_size) : common;
+    for (size_t i = 0; i < count; ++i)
+    {
+        AstType *t = args[i]->type;
+        // Never narrow a vector argument implicitly here
+        if (t->kind == TYPE_VECTOR && t->vector.size != vec_size) return;
+    }
+    for (size_t i = 0; i < count; ++i)
+    {
+        wrapAutoCast(a, args[i], target);
+    }
+}
+
+// Converts the operands of a binary expression so their scalar element
+// types match, keeping each operand's own shape (scalar or vector).
+static void promoteBinaryOperands(Analyzer *a, AstExpr *expr)
+{
+    Module *m = a->module;
+    AstExpr *l = expr->binary.left;
+    AstExpr *r = expr->binary.right;
+    if (!l->type || !r->type) return;
+
+    AstType *ls = ts__getScalarType(l->type);
+    AstType *rs = ts__getScalarType(r->type);
+    if (!ls || !rs || ls == rs) return;
+
+    AstType *common = commonScalarType(ls, rs);
+    if (!common) return;
+
+    if (ls != common)
+    {
+        wrapAutoCast(a, l, (l->type->kind == TYPE_VECTOR)
+            ? newVectorType(m, common, l->type->vector.size) : common);
+    }
+    if (rs != common)
+    {
+        wrapAutoCast(a, r, (r->type->kind == TYPE_VECTOR)
+            ? newVectorType(m, common, r->type->vector.size) : common);
+    }
+}
+
 static void analyzerAnalyzeStmt(Analyzer *a, AstStmt *stmt);
 static void analyzerAnalyzeDecl(Analyzer *a, AstDecl *decl);
 
@@ -1596,6 +1792,12 @@ static void analyzerAnalyzeExpr(Analyzer *a, AstExpr *expr, AstType *expected_ty
     }
 
     case EXPR_FUNC_CALL: {
+        if (desugarIntrinsic(compiler, expr))
+        {
+            analyzerAnalyzeExpr(a, expr, expected_type);
+            return;
+        }
+
         AstExpr *func_expr = expr->func_call.func_expr;
 
         bool is_builtin_func = false;
@@ -1912,6 +2114,8 @@ static void analyzerAnalyzeExpr(Analyzer *a, AstExpr *expr, AstType *expected_ty
                     break;
                 }
 
+                unifyIntrinsicArgs(a, params.ptr, 2, true);
+
                 tryCoerceExprToScalarType(a, params.ptr[0], newFloatType(m, 32));
                 tryCoerceExprToScalarType(a, params.ptr[1], newFloatType(m, 32));
 
@@ -2056,6 +2260,8 @@ static void analyzerAnalyzeExpr(Analyzer *a, AstExpr *expr, AstType *expected_ty
                     break;
                 }
 
+                unifyIntrinsicArgs(a, params.ptr, 2, true);
+
                 tryCoerceExprToScalarType(a, params.ptr[0], newFloatType(m, 32));
                 tryCoerceExprToScalarType(a, params.ptr[1], newFloatType(m, 32));
 
@@ -2143,6 +2349,7 @@ static void analyzerAnalyzeExpr(Analyzer *a, AstExpr *expr, AstType *expected_ty
                 break;
             }
 
+            case AST_BUILTIN_FUNC_SIGN:
             case AST_BUILTIN_FUNC_ABS: {
                 if (param_count != 1)
                 {
@@ -2163,11 +2370,22 @@ static void analyzerAnalyzeExpr(Analyzer *a, AstExpr *expr, AstType *expected_ty
                     !(scalar_type->kind == TYPE_INT || scalar_type->kind == TYPE_FLOAT))
                 {
                     ts__addErr(
-                        compiler, &expr->loc, "abs operates on vectors or scalars");
+                        compiler, &expr->loc, "abs/sign operate on vectors or scalars");
                     break;
                 }
 
                 expr->type = a->type;
+
+                if (builtin_func_kind == AST_BUILTIN_FUNC_SIGN &&
+                    scalar_type->kind == TYPE_FLOAT)
+                {
+                    // HLSL sign() returns int: FSign, then convert
+                    AstType *int_type = newIntType(m, 32, true);
+                    AstType *res_type = (a->type->kind == TYPE_VECTOR)
+                        ? newVectorType(m, int_type, a->type->vector.size) : int_type;
+                    // 'a' is shadowed by the parameter here; use the analyzer via the expr
+                    wrapAutoCastM(compiler, expr, res_type);
+                }
 
                 break;
             }
@@ -2179,6 +2397,8 @@ static void analyzerAnalyzeExpr(Analyzer *a, AstExpr *expr, AstType *expected_ty
                     ts__addErr(compiler, &expr->loc, "min/max takes 2 parameters");
                     break;
                 }
+
+                unifyIntrinsicArgs(a, params.ptr, 2, false);
 
                 if (expected_type &&
                     canCoerceExprToScalarType(a, params.ptr[0], expected_type) &&
@@ -2218,6 +2438,7 @@ static void analyzerAnalyzeExpr(Analyzer *a, AstExpr *expr, AstType *expected_ty
             case AST_BUILTIN_FUNC_TRUNC:
             case AST_BUILTIN_FUNC_CEIL:
             case AST_BUILTIN_FUNC_FLOOR:
+            case AST_BUILTIN_FUNC_ROUND:
             case AST_BUILTIN_FUNC_FRAC: {
                 if (param_count != 1)
                 {
@@ -2256,6 +2477,8 @@ static void analyzerAnalyzeExpr(Analyzer *a, AstExpr *expr, AstType *expected_ty
                     ts__addErr(compiler, &expr->loc, "lerp takes 3 parameters");
                     break;
                 }
+
+                unifyIntrinsicArgs(a, params.ptr, 3, true);
 
                 if (expected_type &&
                     canCoerceExprToScalarType(a, params.ptr[0], expected_type) &&
@@ -2300,6 +2523,8 @@ static void analyzerAnalyzeExpr(Analyzer *a, AstExpr *expr, AstType *expected_ty
                     ts__addErr(compiler, &expr->loc, "clamp takes 3 parameters");
                     break;
                 }
+
+                unifyIntrinsicArgs(a, params.ptr, 3, false);
 
                 if (expected_type &&
                     canCoerceExprToScalarType(a, params.ptr[0], expected_type) &&
@@ -2353,6 +2578,8 @@ static void analyzerAnalyzeExpr(Analyzer *a, AstExpr *expr, AstType *expected_ty
                     break;
                 }
 
+                unifyIntrinsicArgs(a, params.ptr, 2, true);
+
                 tryCoerceExprToScalarType(a, params.ptr[0], newFloatType(m, 32));
                 tryCoerceExprToScalarType(a, params.ptr[1], newFloatType(m, 32));
 
@@ -2388,6 +2615,8 @@ static void analyzerAnalyzeExpr(Analyzer *a, AstExpr *expr, AstType *expected_ty
                     ts__addErr(compiler, &expr->loc, "smoothstep takes 3 parameters");
                     break;
                 }
+
+                unifyIntrinsicArgs(a, params.ptr, 3, true);
 
                 tryCoerceExprToScalarType(a, params.ptr[0], newFloatType(m, 32));
                 tryCoerceExprToScalarType(a, params.ptr[1], newFloatType(m, 32));
@@ -2428,6 +2657,8 @@ static void analyzerAnalyzeExpr(Analyzer *a, AstExpr *expr, AstType *expected_ty
                     ts__addErr(compiler, &expr->loc, "fmod needs 2 parameters");
                     break;
                 }
+
+                unifyIntrinsicArgs(a, params.ptr, 2, true);
 
                 tryCoerceExprToScalarType(a, params.ptr[0], newFloatType(m, 32));
                 tryCoerceExprToScalarType(a, params.ptr[1], newFloatType(m, 32));
@@ -3520,6 +3751,8 @@ static void analyzerAnalyzeExpr(Analyzer *a, AstExpr *expr, AstType *expected_ty
             tryCoerceExprToScalarType(a, expr->binary.left, expr->binary.right->type);
             tryCoerceExprToScalarType(a, expr->binary.right, expr->binary.left->type);
 
+            promoteBinaryOperands(a, expr);
+
             AstType *left_type = expr->binary.left->type;
             AstType *right_type = expr->binary.right->type;
 
@@ -3630,6 +3863,8 @@ static void analyzerAnalyzeExpr(Analyzer *a, AstExpr *expr, AstType *expected_ty
 
             tryCoerceExprToScalarType(a, expr->binary.left, expr->binary.right->type);
             tryCoerceExprToScalarType(a, expr->binary.right, expr->binary.left->type);
+
+            promoteBinaryOperands(a, expr);
 
             AstType *left_type = expr->binary.left->type;
             AstType *right_type = expr->binary.right->type;

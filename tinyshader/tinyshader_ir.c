@@ -2310,6 +2310,31 @@ static void irModuleEncodeBlock(IRModule *m, IRInst *block)
                 break;
             }
 
+            case IR_BUILTIN_ROUND: {
+                uint32_t params[1] = {param_values[0]->id};
+                irModuleEncodeExtInst(m, inst, GLSLstd450Round, params, 1);
+                break;
+            }
+
+            case IR_BUILTIN_SIGN: {
+                IRType *scalar_type = inst->type;
+                if (scalar_type->kind == IR_TYPE_VECTOR)
+                {
+                    scalar_type = scalar_type->vector.elem_type;
+                }
+
+                uint32_t params[1] = {param_values[0]->id};
+                if (scalar_type->kind == IR_TYPE_FLOAT)
+                {
+                    irModuleEncodeExtInst(m, inst, GLSLstd450FSign, params, 1);
+                }
+                else
+                {
+                    irModuleEncodeExtInst(m, inst, GLSLstd450SSign, params, 1);
+                }
+                break;
+            }
+
             case IR_BUILTIN_LERP: {
                 uint32_t params[3] = {
                     param_values[0]->id, param_values[1]->id, param_values[2]->id};

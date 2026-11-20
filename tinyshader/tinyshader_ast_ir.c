@@ -822,6 +822,8 @@ static void astBuildExpr(Module *ast_mod, IRModule *ir_mod, AstExpr *expr)
                 case AST_BUILTIN_FUNC_EXP: ir_builtin_kind = IR_BUILTIN_EXP; break;
                 case AST_BUILTIN_FUNC_EXP2: ir_builtin_kind = IR_BUILTIN_EXP2; break;
                 case AST_BUILTIN_FUNC_FLOOR: ir_builtin_kind = IR_BUILTIN_FLOOR; break;
+                case AST_BUILTIN_FUNC_ROUND: ir_builtin_kind = IR_BUILTIN_ROUND; break;
+                case AST_BUILTIN_FUNC_SIGN: ir_builtin_kind = IR_BUILTIN_SIGN; break;
                 case AST_BUILTIN_FUNC_FMOD: ir_builtin_kind = IR_BUILTIN_FMOD; break;
                 case AST_BUILTIN_FUNC_FRAC: ir_builtin_kind = IR_BUILTIN_FRAC; break;
                 case AST_BUILTIN_FUNC_LENGTH: ir_builtin_kind = IR_BUILTIN_LENGTH; break;
