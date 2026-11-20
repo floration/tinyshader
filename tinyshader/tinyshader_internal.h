@@ -477,6 +477,7 @@ typedef enum IRInstKind {
     IR_INST_BRANCH,
     IR_INST_COND_BRANCH,
     IR_INST_SWITCH,
+    IR_INST_UNREACHABLE,
 
     IR_INST_BUILTIN_CALL,
     IR_INST_BARRIER,
@@ -1557,6 +1558,7 @@ void ts__irBuildCondBr(
     IRInst *false_block,
     IRInst *merge_block,
     IRInst *continue_block);
+void ts__irBuildUnreachable(IRModule *m);
 void ts__irBuildSwitch(
     IRModule *m,
     IRInst *selector,

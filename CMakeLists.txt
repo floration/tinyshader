@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.1)
+cmake_minimum_required(VERSION 3.5)
 project(tinyshader VERSION 1.0 LANGUAGES C)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -22,16 +22,12 @@ target_include_directories(tinyshader PUBLIC tinyshader)
 add_executable(tsc tsc/tsc.c)
 target_link_libraries(tsc PRIVATE tinyshader)
 
+option(TS_SANITIZE "Build with UBSan (debugging only; makes binaries much larger)" OFF)
+
 if (NOT MSVC)
-  target_compile_options(
-    tinyshader
-    PUBLIC
-    -Wall -Wextra -Wno-unused-function
-    -fsanitize=undefined
-  )
-  target_link_options(
-    tinyshader
-    PUBLIC
-    -fsanitize=undefined
-  )
+  target_compile_options(tinyshader PRIVATE -Wall -Wextra -Wno-unused-function)
+  if (TS_SANITIZE)
+    target_compile_options(tinyshader PUBLIC -fsanitize=undefined)
+    target_link_options(tinyshader PUBLIC -fsanitize=undefined)
+  endif()
 endif()

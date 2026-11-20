@@ -1,0 +1,1 @@
+float4 main(float3 n : NORMAL, float x : X) : SV_Target { float a = saturate(x); float b = mad(x, 2.0, 1); float c = rcp(x) + log10(x); float3 s = sign(n); float r = round(x); return float4(s * (a + b + c + r), 1); }

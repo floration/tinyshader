@@ -67,7 +67,6 @@ static bool compileStage(
     if (!f)
     {
         fprintf(stderr, "failed to open output file\n");
-        fclose(f);
         tsCompilerOutputDestroy(output);
         tsCompilerOptionsDestroy(options);
         return false;

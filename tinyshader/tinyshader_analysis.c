@@ -1017,6 +1017,53 @@ static void tryCoerceExprToScalarType(Analyzer *a, AstExpr *expr, AstType *scala
 
 static void analyzerAnalyzeExpr(Analyzer *a, AstExpr *expr, AstType *expected_type);
 
+// Does a 'break' inside this statement leave the enclosing switch?
+// Breaks nested in loops or inner switches belong to those instead.
+static bool stmtBreaksOut(AstStmt *stmt)
+{
+    if (!stmt) return false;
+    switch (stmt->kind)
+    {
+    case STMT_BREAK: return true;
+    case STMT_BLOCK:
+        for (size_t i = 0; i < stmt->block.stmts.len; ++i)
+            if (stmtBreaksOut(stmt->block.stmts.ptr[i])) return true;
+        return false;
+    case STMT_IF:
+        return stmtBreaksOut(stmt->if_.if_stmt) || stmtBreaksOut(stmt->if_.else_stmt);
+    default: return false;
+    }
+}
+
+// Conservative: true only if control can never reach the end of 'stmt'.
+static bool stmtAlwaysReturns(AstStmt *stmt)
+{
+    if (!stmt) return false;
+    switch (stmt->kind)
+    {
+    case STMT_RETURN:
+    case STMT_DISCARD: return true;
+    case STMT_BLOCK:
+        for (size_t i = 0; i < stmt->block.stmts.len; ++i)
+            if (stmtAlwaysReturns(stmt->block.stmts.ptr[i])) return true;
+        return false;
+    case STMT_IF:
+        return stmt->if_.else_stmt && stmtAlwaysReturns(stmt->if_.if_stmt) &&
+               stmtAlwaysReturns(stmt->if_.else_stmt);
+    case STMT_SWITCH: {
+        bool has_default = false;
+        for (size_t i = 0; i < stmt->switch_.labels.len; ++i)
+            if (!stmt->switch_.labels.ptr[i].value) has_default = true;
+        if (!has_default || stmtBreaksOut(stmt->switch_.body)) return false;
+        // Without breaks every section falls through to the end, so the
+        // switch returns iff its last statement does.
+        ArrayOfAstStmtPtr stmts = stmt->switch_.body->block.stmts;
+        return stmts.len > 0 && stmtAlwaysReturns(stmts.ptr[stmts.len - 1]);
+    }
+    default: return false;
+    }
+}
+
 //
 // Intrinsics that are expressible in terms of other HLSL constructs are
 // rewritten here, before analysis, so codegen doesn't need to know them.
@@ -4456,7 +4503,7 @@ static void analyzerAnalyzeDecl(Analyzer *a, AstDecl *decl)
             AstStmt *stmt = decl->func.stmts.ptr[i];
             analyzerAnalyzeStmt(a, stmt);
 
-            if (stmt->kind == STMT_RETURN)
+            if (stmtAlwaysReturns(stmt))
             {
                 found_return = true;
             }

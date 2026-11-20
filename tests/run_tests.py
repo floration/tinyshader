@@ -1,101 +1,113 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
+"""Compile every test shader with tinyshader and DXC, then validate the SPIR-V.
 
-import os, subprocess
+Needs dxc, spirv-val and spirv-opt on PATH (all ship with the Vulkan SDK).
+Usage: python tests/run_tests.py [--no-dxc] [--no-opt] [filter]
+"""
 
-# Go to base dir
-os.chdir(os.path.dirname(os.path.realpath(__file__)) + "/..")
+import os, shutil, subprocess, sys
 
-if not os.path.exists("./build"):
-    subprocess.run(["cmake", "-Bbuild", os.getcwd()])
+ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+os.chdir(ROOT)
 
-subprocess.run(["cmake", "--build", "build"])
+args = [a for a in sys.argv[1:] if not a.startswith("--")]
+use_dxc = "--no-dxc" not in sys.argv
+use_opt = "--no-opt" not in sys.argv
+name_filter = args[0] if args else ""
 
-if os.name == "nt":
-    if os.path.exists("build/tsc.exe"):
-        compiler_exe = "build/tsc.exe"
-    elif os.path.exists("build/Debug/tsc.exe"):
-        compiler_exe = "build/Debug/tsc.exe"
-    elif os.path.exists("build/Release/tsc.exe"):
-        compiler_exe = "build/Release/tsc.exe"
-else:
-    compiler_exe = "./build/tsc"
+for tool in (["spirv-val"] + (["dxc"] if use_dxc else []) + (["spirv-opt"] if use_opt else [])):
+    if not shutil.which(tool):
+        sys.exit(f"error: '{tool}' not found on PATH (install the Vulkan SDK)")
 
-failed_tests = []
+subprocess.run(["cmake", "-B", "build", "-DCMAKE_BUILD_TYPE=Release"], check=True,
+               stdout=subprocess.DEVNULL)
+subprocess.run(["cmake", "--build", "build", "--config", "Release"], check=True,
+               stdout=subprocess.DEVNULL)
 
-def run_proc(cmd_line):
-    print("     Running:", cmd_line)
-    return subprocess.run(cmd_line.split(" ")).returncode == 0
+compiler_exe = None
+for cand in ["build/tsc", "build/tsc.exe", "build/Release/tsc.exe", "build/Debug/tsc.exe"]:
+    if os.path.exists(cand):
+        compiler_exe = cand
+        break
+if not compiler_exe:
+    sys.exit("error: could not find the built tsc executable")
 
-def test_dir(dir, expected_result):
-    if expected_result:
-        print("\n=== Running VALID tests ===")
-    else:
-        print("\n=== Running INVALID tests ===")
+STAGES = {".frag": ("fragment", "ps_6_0"), ".vert": ("vertex", "vs_6_0"), ".comp": ("compute", "cs_6_0")}
+TARGET_ENV = "vulkan1.1"
 
-    outdir = dir + '_out'
+def run(cmd):
+    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    return r.returncode == 0, r.stdout.strip()
 
-    for filename in os.listdir(dir):
-        splitname = os.path.splitext(filename)
-        if splitname[1] != ".hlsl":
+failed = []
+sizes = []
+
+def test_dir(dir, expect_ok):
+    print(f"\n=== {'VALID' if expect_ok else 'INVALID'} tests ===")
+    outdir = dir + "_out"
+    os.makedirs(outdir, exist_ok=True)
+
+    for filename in sorted(os.listdir(dir)):
+        base, ext = os.path.splitext(filename)
+        if ext != ".hlsl" or name_filter not in filename:
             continue
-
-        no_ext_name = splitname[0]
-        fullpath = os.path.join(dir, filename)
-        out_path = os.path.join(outdir, no_ext_name + ".spv")
-        dxc_out_path = os.path.join(outdir, no_ext_name + ".dxc.spv")
-
-        stage = None
-        dxc_stage = None
-        if no_ext_name.endswith(".frag"):
-            stage = "fragment"
-            dxc_stage = "ps_6_0"
-        elif no_ext_name.endswith(".vert"):
-            stage = "vertex"
-            dxc_stage = "vs_6_0"
-        elif no_ext_name.endswith(".comp"):
-            stage = "compute"
-            dxc_stage = "cs_6_0"
-        else:
+        stage_ext = os.path.splitext(base)[1]
+        if stage_ext not in STAGES:
             continue
+        stage, dxc_profile = STAGES[stage_ext]
+        src = os.path.join(dir, filename)
+        out = os.path.join(outdir, base + ".spv")
+        problems = []
 
-        print("  => Testing:", fullpath)
+        ok, log = run([compiler_exe, "-T", stage, "-E", "main", "-o", out, src])
+        if ok != expect_ok:
+            problems.append(("tinyshader " + ("failed" if expect_ok else "accepted invalid shader"), log))
 
-        failed = False
+        if ok and expect_ok:
+            ok_val, log = run(["spirv-val", "--target-env", TARGET_ENV, out])
+            if not ok_val:
+                problems.append(("spirv-val rejected tinyshader output", log))
+            elif use_opt:
+                opt_out = os.path.join(outdir, base + ".opt.spv")
+                ok_opt, log = run(["spirv-opt", "-O", "--target-env=" + TARGET_ENV, out, "-o", opt_out])
+                if not ok_opt:
+                    problems.append(("spirv-opt -O failed", log))
+                else:
+                    sizes.append((filename, os.path.getsize(out), os.path.getsize(opt_out)))
 
-        # Run DXC
-        success = run_proc(
-            f"dxc {fullpath} -Od -E main -T {dxc_stage} -Fo {dxc_out_path} -spirv -fspv-target-env=vulkan1.1")
-        if success != expected_result:
-            failed = True
+        if use_dxc:
+            dxc_out = os.path.join(outdir, base + ".dxc.spv")
+            ok_dxc, log = run(["dxc", src, "-E", "main", "-T", dxc_profile, "-spirv",
+                               "-fspv-target-env=" + TARGET_ENV, "-Fo", dxc_out])
+            if ok_dxc != expect_ok:
+                # Disagreement with DXC is worth knowing about, but it is the
+                # reference, so report it separately rather than as our failure.
+                problems.append(("DXC disagrees (" + ("rejects" if expect_ok else "accepts") + ")", log))
 
-        if success:
-            success = run_proc(f"spirv-val {dxc_out_path}")
-            if success != expected_result: failed = True
+        status = "FAIL" if problems else "ok"
+        print(f"  [{status:>4}] {src}")
+        for what, log in problems:
+            print(f"         {what}")
+            for line in log.splitlines()[:12]:
+                print("           " + line)
+        if problems:
+            failed.append(src)
 
-        # Run tinyshader
-        success = run_proc(
-            f"{compiler_exe} -E main -T {stage} -o {out_path} {fullpath}")
-        if success != expected_result:
-            failed = True
+test_dir("tests/valid", True)
+test_dir("tests/invalid", False)
 
-        if success:
-            success = run_proc(f"spirv-val {out_path}")
-            if success != expected_result: failed = True
+if sizes:
+    print("\n=== SPIR-V size (bytes): tinyshader -> after spirv-opt -O ===")
+    for name, raw, opt in sizes:
+        print(f"  {name:40} {raw:6} -> {opt:6}")
 
-
-        if failed:
-            failed_tests.append(fullpath)
-
-test_dir("./tests/valid", True)
-test_dir("./tests/invalid", False)
+exe_size = os.path.getsize(compiler_exe)
+print(f"\ntsc binary: {exe_size/1024:.0f} KiB ({compiler_exe})")
 
 print("\n=== RESULTS ===")
-
-if len(failed_tests) > 0:
-    print("Tests failed:")
-    for f in failed_tests:
-        print(f)
-    exit(1)
-else:
-    print("All tests passed")
-    exit(0)
+if failed:
+    print(f"{len(failed)} failed:")
+    for f in failed:
+        print("  " + f)
+    sys.exit(1)
+print("All tests passed")

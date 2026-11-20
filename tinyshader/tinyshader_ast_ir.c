@@ -2222,7 +2222,16 @@ static void astBuildDecl(Module *ast_mod, IRModule *ir_mod, AstDecl *decl)
 
         if (!ts__irBlockHasTerminator(ts__irGetCurrentBlock(ir_mod)))
         {
-            ts__irBuildReturn(ir_mod, NULL);
+            AstType *ret = decl->type->func.return_type;
+            if (ret && ret->kind != TYPE_VOID)
+            {
+                // Analysis proved every path returns; this block is unreachable
+                ts__irBuildUnreachable(ir_mod);
+            }
+            else
+            {
+                ts__irBuildReturn(ir_mod, NULL);
+            }
         }
 
         break;

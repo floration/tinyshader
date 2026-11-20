@@ -657,6 +657,7 @@ bool ts__irBlockHasTerminator(IRInst *block)
     {
     case IR_INST_COND_BRANCH:
     case IR_INST_SWITCH:
+    case IR_INST_UNREACHABLE:
     case IR_INST_BRANCH:
     case IR_INST_DISCARD:
     case IR_INST_RETURN: return true;
@@ -1372,6 +1373,15 @@ void ts__irBuildCondBr(
     arrPush(m->compiler, &block->block.insts, inst);
 }
 
+void ts__irBuildUnreachable(IRModule *m)
+{
+    IRInst *inst = NEW(m->compiler, IRInst);
+    inst->kind = IR_INST_UNREACHABLE;
+
+    IRInst *block = ts__irGetCurrentBlock(m);
+    arrPush(m->compiler, &block->block.insts, inst);
+}
+
 void ts__irBuildSwitch(
     IRModule *m,
     IRInst *selector,
@@ -1821,6 +1831,11 @@ static void irModuleEncodeBlock(IRModule *m, IRInst *block)
             {
                 irModuleEncodeInst(m, SpvOpReturn, NULL, 0);
             }
+            break;
+        }
+
+        case IR_INST_UNREACHABLE: {
+            irModuleEncodeInst(m, SpvOpUnreachable, NULL, 0);
             break;
         }
 
