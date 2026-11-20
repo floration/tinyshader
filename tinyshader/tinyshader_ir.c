@@ -964,6 +964,27 @@ IRInst *ts__irBuildAlloca(IRModule *m, IRType *type)
     return inst;
 }
 
+// A Function variable placed at the top of the current function's entry
+// block (where SPIR-V requires all OpVariables), wherever we are now.
+IRInst *ts__irBuildEntryAlloca(IRModule *m, IRType *type)
+{
+    IRInst *inst = NEW(m->compiler, IRInst);
+    inst->kind = IR_INST_VARIABLE;
+    inst->var.storage_class = SpvStorageClassFunction;
+    inst->type = ts__irNewPointerType(m, inst->var.storage_class, type);
+
+    IRInst *func = ts__irGetCurrentBlock(m)->block.func;
+    TS_ASSERT(func->func.blocks.len > 0);
+    IRInst *entry = func->func.blocks.ptr[0];
+
+    arrPush(m->compiler, &entry->block.insts, NULL);
+    memmove(&entry->block.insts.ptr[1], &entry->block.insts.ptr[0],
+            (entry->block.insts.len - 1) * sizeof(IRInst *));
+    entry->block.insts.ptr[0] = inst;
+
+    return inst;
+}
+
 // Rebuilds a composite value as an equivalent type that differs only in
 // explicit layout (e.g. a struct loaded from a constant buffer being stored
 // into a local), member by member. SPIR-V 1.3 has no OpCopyLogical.

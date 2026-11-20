@@ -4500,12 +4500,34 @@ static void analyzerAnalyzeExpr(Analyzer *a, AstExpr *expr, AstType *expected_ty
 
             break;
         }
+        case TYPE_STRUCT:
+        {
+            // { member0, member1, ... } (nested braces for nested aggregates)
+            expr->type = expected_type;
+
+            if (exprs_length != expected_type->struct_.field_count)
+            {
+                ts__addErr(
+                    compiler,
+                    &expr->loc,
+                    "expected %zu struct members, instead got %zu",
+                    (size_t)expected_type->struct_.field_count,
+                    exprs_length);
+                break;
+            }
+
+            for (size_t i = 0; i < exprs_length; ++i)
+            {
+                analyzerAnalyzeExpr(a, exprs[i], expected_type->struct_.fields[i]);
+            }
+            break;
+        }
         default:
         {
             ts__addErr(
                 compiler,
                 &expr->loc,
-                "invalid type for composite literal: '%s', expected an array or vector type",
+                "invalid type for composite literal: '%s', expected an array, vector or struct type",
                 ts__typeToPrettyString(compiler, expected_type));
             break;
         }

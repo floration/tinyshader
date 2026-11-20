@@ -1587,6 +1587,7 @@ void ts__irBuildCondBr(
 void ts__irBuildUnreachable(IRModule *m);
 IRInst *ts__irConvertLayout(IRModule *m, IRInst *value, IRType *dst_type);
 IRInst *ts__irBuildZeroValue(IRModule *m, IRType *type);
+IRInst *ts__irBuildEntryAlloca(IRModule *m, IRType *type);
 IRInst *ts__irBuildSplatValue(IRModule *m, IRType *type, IRInst *scalar);
 void ts__irBuildSwitch(
     IRModule *m,

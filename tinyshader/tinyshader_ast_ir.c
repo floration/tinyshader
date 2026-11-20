@@ -1652,6 +1652,42 @@ static void astBuildExpr(Module *ast_mod, IRModule *ir_mod, AstExpr *expr)
     }
 
     case EXPR_BINARY: {
+        if ((expr->binary.op == BINOP_LOGICAL_AND || expr->binary.op == BINOP_LOGICAL_OR) &&
+            expr->type->kind == TYPE_BOOL)
+        {
+            // Scalar && and || short-circuit (HLSL 2021): the right side only
+            // runs when it decides the result.
+            //   result = left; if (left [== is_and]) result = right;
+            bool is_and = expr->binary.op == BINOP_LOGICAL_AND;
+            IRType *bool_type = ts__irNewBasicType(ir_mod, IR_TYPE_BOOL);
+
+            astBuildExpr(ast_mod, ir_mod, expr->binary.left);
+            IRInst *left_val = loadVal(ir_mod, expr->binary.left->value);
+
+            IRInst *result = ts__irBuildEntryAlloca(ir_mod, bool_type);
+            ts__irBuildStore(ir_mod, result, left_val);
+
+            IRInst *func = ts__irGetCurrentBlock(ir_mod)->block.func;
+            IRInst *rhs_block = ts__irCreateBlock(ir_mod, func);
+            IRInst *merge_block = ts__irCreateBlock(ir_mod, func);
+
+            if (is_and)
+                ts__irBuildCondBr(ir_mod, left_val, rhs_block, merge_block, merge_block, NULL);
+            else
+                ts__irBuildCondBr(ir_mod, left_val, merge_block, rhs_block, merge_block, NULL);
+
+            ts__irPositionAtEnd(ir_mod, rhs_block);
+            ts__irAddBlock(ir_mod, rhs_block);
+            astBuildExpr(ast_mod, ir_mod, expr->binary.right);
+            ts__irBuildStore(ir_mod, result, loadVal(ir_mod, expr->binary.right->value));
+            ts__irBuildBr(ir_mod, merge_block, NULL, NULL);
+
+            ts__irPositionAtEnd(ir_mod, merge_block);
+            ts__irAddBlock(ir_mod, merge_block);
+            expr->value = ts__irBuildLoad(ir_mod, result);
+            break;
+        }
+
         astBuildExpr(ast_mod, ir_mod, expr->binary.left);
         IRInst *left_val = loadVal(ir_mod, expr->binary.left->value);
         astBuildExpr(ast_mod, ir_mod, expr->binary.right);
@@ -1879,6 +1915,37 @@ static void astBuildExpr(Module *ast_mod, IRModule *ir_mod, AstExpr *expr)
     case EXPR_TERNARY: {
         IRType *ir_type = convertTypeToIR(ast_mod, ir_mod, expr->type);
 
+        if (expr->ternary.cond->type->kind != TYPE_VECTOR)
+        {
+            // Scalar condition: only the chosen side runs (HLSL 2021). This also
+            // works for structs and arrays, which OpSelect can't take in SPIR-V 1.3.
+            astBuildExpr(ast_mod, ir_mod, expr->ternary.cond);
+            IRInst *cond = loadVal(ir_mod, expr->ternary.cond->value);
+
+            IRInst *result = ts__irBuildEntryAlloca(ir_mod, ir_type);
+            IRInst *func = ts__irGetCurrentBlock(ir_mod)->block.func;
+            IRInst *true_block = ts__irCreateBlock(ir_mod, func);
+            IRInst *false_block = ts__irCreateBlock(ir_mod, func);
+            IRInst *merge_block = ts__irCreateBlock(ir_mod, func);
+            ts__irBuildCondBr(ir_mod, cond, true_block, false_block, merge_block, NULL);
+
+            AstExpr *sides[2] = {expr->ternary.true_expr, expr->ternary.false_expr};
+            IRInst *blocks[2] = {true_block, false_block};
+            for (int i = 0; i < 2; ++i)
+            {
+                ts__irPositionAtEnd(ir_mod, blocks[i]);
+                ts__irAddBlock(ir_mod, blocks[i]);
+                astBuildExpr(ast_mod, ir_mod, sides[i]);
+                ts__irBuildStore(ir_mod, result, loadVal(ir_mod, sides[i]->value));
+                ts__irBuildBr(ir_mod, merge_block, NULL, NULL);
+            }
+
+            ts__irPositionAtEnd(ir_mod, merge_block);
+            ts__irAddBlock(ir_mod, merge_block);
+            expr->value = ts__irBuildLoad(ir_mod, result);
+            break;
+        }
+
         astBuildExpr(ast_mod, ir_mod, expr->ternary.cond);
         IRInst *cond = loadVal(ir_mod, expr->ternary.cond->value);
 
@@ -2020,13 +2087,14 @@ static void astBuildExpr(Module *ast_mod, IRModule *ir_mod, AstExpr *expr)
         for (size_t i = 0; i < exprs_length; ++i)
         {
             astBuildExpr(ast_mod, ir_mod, exprs[i]);
-            elems[i] = exprs[i]->value;
+            elems[i] = loadVal(ir_mod, exprs[i]->value);
         }
 
         switch (expr->type->kind)
         {
         case TYPE_VECTOR:
         case TYPE_ARRAY:
+        case TYPE_STRUCT:
         {
             expr->value = ts__irBuildCompositeConstruct(
                 ir_mod, ir_type, elems, exprs_length);
@@ -2281,6 +2349,13 @@ static void astBuildStmt(Module *ast_mod, IRModule *ir_mod, AstStmt *stmt)
             ts__irPositionAtEnd(ir_mod, check_block);
             ts__irAddBlock(ir_mod, check_block);
 
+            // The loop header only holds the merge; the condition gets its own
+            // block so it may contain control flow (short-circuit &&, ?:).
+            IRInst *cond_block = ts__irCreateBlock(ir_mod, func);
+            ts__irBuildBr(ir_mod, cond_block, merge_block, continue_block);
+            ts__irPositionAtEnd(ir_mod, cond_block);
+            ts__irAddBlock(ir_mod, cond_block);
+
             astBuildExpr(ast_mod, ir_mod, stmt->while_.cond);
             IRInst *cond = stmt->while_.cond->value;
             TS_ASSERT(cond);
@@ -2289,8 +2364,7 @@ static void astBuildStmt(Module *ast_mod, IRModule *ir_mod, AstStmt *stmt)
 
             if (!ts__irBlockHasTerminator(ts__irGetCurrentBlock(ir_mod)))
             {
-                ts__irBuildCondBr(
-                    ir_mod, cond, body_block, merge_block, merge_block, continue_block);
+                ts__irBuildCondBr(ir_mod, cond, body_block, merge_block, NULL, NULL);
             }
         }
 
@@ -2399,6 +2473,12 @@ static void astBuildStmt(Module *ast_mod, IRModule *ir_mod, AstStmt *stmt)
             ts__irPositionAtEnd(ir_mod, check_block);
             ts__irAddBlock(ir_mod, check_block);
 
+            // Header holds only the merge; see STMT_WHILE
+            IRInst *cond_block = ts__irCreateBlock(ir_mod, func);
+            ts__irBuildBr(ir_mod, cond_block, merge_block, continue_block);
+            ts__irPositionAtEnd(ir_mod, cond_block);
+            ts__irAddBlock(ir_mod, cond_block);
+
             IRInst *cond = NULL;
 
             if (stmt->for_.cond)
@@ -2416,8 +2496,7 @@ static void astBuildStmt(Module *ast_mod, IRModule *ir_mod, AstStmt *stmt)
 
             if (!ts__irBlockHasTerminator(ts__irGetCurrentBlock(ir_mod)))
             {
-                ts__irBuildCondBr(
-                    ir_mod, cond, body_block, merge_block, merge_block, continue_block);
+                ts__irBuildCondBr(ir_mod, cond, body_block, merge_block, NULL, NULL);
             }
         }
 
