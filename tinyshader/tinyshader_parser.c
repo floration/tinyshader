@@ -406,9 +406,78 @@ static AstExpr *parsePostfixedUnaryExpr(Parser *p)
     return expr;
 }
 
+static bool isTypeToken(TokenKind kind)
+{
+    switch (kind)
+    {
+    case TOKEN_BOOL:
+    case TOKEN_UINT:
+    case TOKEN_INT:
+    case TOKEN_FLOAT:
+    case TOKEN_VECTOR_TYPE:
+    case TOKEN_MATRIX_TYPE: return true;
+    default: return false;
+    }
+}
+
+// Can this token begin an operand (as opposed to being a binary operator)?
+// Used to tell "(Name)x" (a cast) apart from "(a) - b" (a parenthesized value).
+static bool startsCastOperand(TokenKind kind)
+{
+    switch (kind)
+    {
+    case TOKEN_IDENT:
+    case TOKEN_INT_LIT:
+    case TOKEN_FLOAT_LIT:
+    case TOKEN_TRUE:
+    case TOKEN_FALSE:
+    case TOKEN_LPAREN:
+    case TOKEN_NOT:
+    case TOKEN_BITNOT: return true;
+    default: return isTypeToken(kind);
+    }
+}
+
 static AstExpr *parsePrefixedUnaryExpr(Parser *p)
 {
     Location loc = parserBeginLoc(p);
+
+    // C-style cast: "(float3)x", "(int)f", "(Light)0"
+    if (parserLengthLeft(p) >= 4 && parserPeek(p, 0)->kind == TOKEN_LPAREN &&
+        parserPeek(p, 2)->kind == TOKEN_RPAREN &&
+        (isTypeToken(parserPeek(p, 1)->kind) ||
+         (parserPeek(p, 1)->kind == TOKEN_IDENT && startsCastOperand(parserPeek(p, 3)->kind))))
+    {
+        parserNext(p, 1);
+        Token *type_tok = parserNext(p, 1);
+        parserNext(p, 1);
+
+        AstExpr *type_expr = NEW(p->compiler, AstExpr);
+        type_expr->loc = type_tok->loc;
+        if (type_tok->kind == TOKEN_IDENT)
+        {
+            type_expr->kind = EXPR_IDENT;
+            type_expr->ident.name = type_tok->str;
+        }
+        else
+        {
+            type_expr->kind = EXPR_PRIMARY;
+            type_expr->primary.token = type_tok;
+        }
+
+        AstExpr *operand = parsePrefixedUnaryExpr(p);
+        if (!operand) return NULL;
+
+        AstExpr *expr = NEW(p->compiler, AstExpr);
+        expr->kind = EXPR_FUNC_CALL;
+        expr->func_call.func_expr = type_expr;
+        expr->func_call.is_cast = true;
+        arrPush(p->compiler, &expr->func_call.params, operand);
+
+        parserEndLoc(p, &loc);
+        expr->loc = loc;
+        return expr;
+    }
 
     if (parserPeek(p, 0)->kind == TOKEN_SUB || parserPeek(p, 0)->kind == TOKEN_NOT ||
         parserPeek(p, 0)->kind == TOKEN_ADDADD || parserPeek(p, 0)->kind == TOKEN_SUBSUB|| parserPeek(p, 0)->kind == TOKEN_BITNOT)
@@ -878,6 +947,39 @@ static AstExpr *parseExpr(Parser *p)
     return parseAssignExpr(p);
 }
 
+// HLSL interpolation modifiers. They're contextual (a variable may be named
+// "linear" or "sample"), so they only count when followed by more of a
+// declaration: a type, a name, another modifier or in/out.
+static uint32_t interpolationModifier(Parser *p)
+{
+    Token *tok = parserPeek(p, 0);
+    if (tok->kind != TOKEN_IDENT || parserLengthLeft(p) < 2) return 0;
+
+    uint32_t flag = 0;
+    if (strcmp(tok->str, "nointerpolation") == 0) flag = INTERP_NOINTERPOLATION;
+    else if (strcmp(tok->str, "noperspective") == 0) flag = INTERP_NOPERSPECTIVE;
+    else if (strcmp(tok->str, "centroid") == 0) flag = INTERP_CENTROID;
+    else if (strcmp(tok->str, "sample") == 0) flag = INTERP_SAMPLE;
+    else if (strcmp(tok->str, "linear") == 0) flag = INTERP_LINEAR;
+    if (!flag) return 0;
+
+    switch (parserPeek(p, 1)->kind)
+    {
+    case TOKEN_IDENT:
+    case TOKEN_BOOL:
+    case TOKEN_UINT:
+    case TOKEN_INT:
+    case TOKEN_FLOAT:
+    case TOKEN_VECTOR_TYPE:
+    case TOKEN_MATRIX_TYPE:
+    case TOKEN_CONST:
+    case TOKEN_IN:
+    case TOKEN_OUT:
+    case TOKEN_INOUT: return flag;
+    default: return 0;
+    }
+}
+
 static AstDecl *parseVarDecl(
     Parser *p,
     bool parse_default_value,
@@ -892,6 +994,13 @@ static AstDecl *parseVarDecl(
 
     AstVarStorageClass storage_class = 0;
     AstTypeModifier type_modifiers = 0;
+    uint32_t interpolation = 0;
+
+    for (uint32_t flag; parserLengthLeft(p) > 0 && (flag = interpolationModifier(p));)
+    {
+        interpolation |= flag;
+        parserNext(p, 1);
+    }
 
     Token *current = parserPeek(p, 0);
 
@@ -976,6 +1085,7 @@ static AstDecl *parseVarDecl(
     }
 
     AstDecl *decl = NEW(compiler, AstDecl);
+    decl->interpolation = interpolation;
     decl->kind = DECL_VAR;
     decl->name = name_tok->str;
     decl->var.type_expr = type_expr;
@@ -1712,25 +1822,41 @@ static AstDecl *parseTopLevel(Parser *p)
                 Location param_decl_loc = parserBeginLoc(p);
 
                 AstParameterKind param_kind = PARAM_IN;
+                uint32_t interpolation = 0;
 
-                if (parserPeek(p, 0)->kind == TOKEN_IN)
+                // in/out/inout and interpolation modifiers, in any order
+                for (;;)
                 {
-                    parserNext(p, 1);
-                    param_kind = PARAM_IN;
-                }
-                else if (parserPeek(p, 0)->kind == TOKEN_OUT)
-                {
-                    parserNext(p, 1);
-                    param_kind = PARAM_OUT;
-                }
-                else if (parserPeek(p, 0)->kind == TOKEN_INOUT)
-                {
-                    parserNext(p, 1);
-                    param_kind = PARAM_OUT;
+                    uint32_t flag = interpolationModifier(p);
+                    if (flag)
+                    {
+                        interpolation |= flag;
+                        parserNext(p, 1);
+                    }
+                    else if (parserPeek(p, 0)->kind == TOKEN_IN)
+                    {
+                        parserNext(p, 1);
+                        param_kind = PARAM_IN;
+                    }
+                    else if (parserPeek(p, 0)->kind == TOKEN_OUT)
+                    {
+                        parserNext(p, 1);
+                        param_kind = PARAM_OUT;
+                    }
+                    else if (parserPeek(p, 0)->kind == TOKEN_INOUT)
+                    {
+                        parserNext(p, 1);
+                        param_kind = PARAM_OUT;
+                    }
+                    else
+                    {
+                        break;
+                    }
                 }
 
                 AstDecl *param_decl = parseVarDecl(p, true, NULL, true, false, true);
                 if (!param_decl) return NULL;
+                param_decl->interpolation |= interpolation;
 
                 param_decl->var.parameter_kind = param_kind;
 

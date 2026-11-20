@@ -1351,8 +1351,87 @@ IRInst *ts__irBuildQueryLevels(IRModule *m, IRInst *image)
     return inst;
 }
 
+// A zero of any type: scalars, vectors, matrices, arrays and structs.
+IRInst *ts__irBuildZeroValue(IRModule *m, IRType *type)
+{
+    switch (type->kind)
+    {
+    case IR_TYPE_FLOAT: return ts__irBuildConstFloat(m, type, 0.0);
+    case IR_TYPE_INT: return ts__irBuildConstInt(m, type, 0);
+    case IR_TYPE_BOOL: return ts__irBuildConstBool(m, false);
+    case IR_TYPE_VECTOR:
+    case IR_TYPE_MATRIX:
+    case IR_TYPE_ARRAY:
+    case IR_TYPE_STRUCT: {
+        uint32_t count = 0;
+        if (type->kind == IR_TYPE_VECTOR) count = type->vector.size;
+        else if (type->kind == IR_TYPE_MATRIX) count = type->matrix.col_count;
+        else if (type->kind == IR_TYPE_STRUCT) count = type->struct_.field_count;
+        else
+        {
+            IRInst *size = type->array.size;
+            memcpy(&count, size->constant.value,
+                   size->constant.value_size_bytes < 4 ? size->constant.value_size_bytes : 4);
+        }
+
+        IRInst **elems = NEW_ARRAY(m->compiler, IRInst *, count);
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            IRType *elem_type = NULL;
+            switch (type->kind)
+            {
+            case IR_TYPE_VECTOR: elem_type = type->vector.elem_type; break;
+            case IR_TYPE_MATRIX: elem_type = type->matrix.col_type; break;
+            case IR_TYPE_STRUCT: elem_type = type->struct_.fields[i]; break;
+            default: elem_type = type->array.sub; break;
+            }
+            elems[i] = ts__irBuildZeroValue(m, elem_type);
+        }
+        return ts__irBuildCompositeConstruct(m, type, elems, count);
+    }
+    default: TS_ASSERT(0); return NULL;
+    }
+}
+
+static IRType *irElemType(IRType *t)
+{
+    return (t->kind == IR_TYPE_VECTOR) ? t->vector.elem_type : t;
+}
+
+// A constant of 'type' (scalar or vector) with every component = value
+static IRInst *irBuildSplatConst(IRModule *m, IRType *type, double value)
+{
+    IRType *elem = irElemType(type);
+    IRInst *scalar = (elem->kind == IR_TYPE_FLOAT) ? ts__irBuildConstFloat(m, elem, value)
+                                                   : ts__irBuildConstInt(m, elem, (uint64_t)value);
+    if (type->kind != IR_TYPE_VECTOR) return scalar;
+
+    IRInst **elems = NEW_ARRAY(m->compiler, IRInst *, type->vector.size);
+    for (uint32_t i = 0; i < type->vector.size; ++i) elems[i] = scalar;
+    return ts__irBuildConstComposite(m, type, elems, type->vector.size);
+}
+
 IRInst *ts__irBuildCast(IRModule *m, IRType *dst_type, IRInst *value)
 {
+    IRType *src_elem = irElemType(value->type);
+    IRType *dst_elem = irElemType(dst_type);
+
+    // bool -> number: select(b, 1, 0)
+    if (src_elem->kind == IR_TYPE_BOOL && dst_elem->kind != IR_TYPE_BOOL)
+    {
+        return ts__irBuildSelect(
+            m, dst_type, value, irBuildSplatConst(m, dst_type, 1.0),
+            irBuildSplatConst(m, dst_type, 0.0));
+    }
+
+    // number -> bool: x != 0 (unordered, so NaN is true like in HLSL)
+    if (dst_elem->kind == IR_TYPE_BOOL && src_elem->kind != IR_TYPE_BOOL)
+    {
+        SpvOp op = (src_elem->kind == IR_TYPE_FLOAT) ? SpvOpFUnordNotEqual : SpvOpINotEqual;
+        return ts__irBuildBinary(
+            m, op, dst_type, value, irBuildSplatConst(m, value->type, 0.0));
+    }
+
     IRInst *inst = NEW(m->compiler, IRInst);
     inst->kind = IR_INST_CAST;
     inst->type = dst_type;
@@ -3068,6 +3147,12 @@ static void irModuleEncodeModule(IRModule *m)
     if (m->uses_image_query)
     {
         uint32_t params[1] = {SpvCapabilityImageQuery};
+        irModuleEncodeInst(m, SpvOpCapability, params, 1);
+    }
+
+    if (m->uses_sample_rate_shading)
+    {
+        uint32_t params[1] = {SpvCapabilitySampleRateShading};
         irModuleEncodeInst(m, SpvOpCapability, params, 1);
     }
 

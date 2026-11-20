@@ -731,6 +731,13 @@ static bool isTypeCastable(AstType *src_type, AstType *dst_type)
     {
         return true;
     }
+    else if ((src_type->kind == TYPE_BOOL &&
+              (dst_type->kind == TYPE_INT || dst_type->kind == TYPE_FLOAT)) ||
+             (dst_type->kind == TYPE_BOOL &&
+              (src_type->kind == TYPE_INT || src_type->kind == TYPE_FLOAT)))
+    {
+        return true;
+    }
     else if (src_type->kind == TYPE_INT)
     {
         if (src_type->int_.is_signed)
@@ -815,6 +822,7 @@ uint32_t ts__getTypeElemCount(AstType *type)
     switch (type->kind)
     {
     case TYPE_FLOAT:
+    case TYPE_BOOL:
     case TYPE_INT: {
         return 1;
     }
@@ -1131,6 +1139,24 @@ static bool desugarIntrinsic(TsCompiler *compiler, AstExpr *expr)
         *expr = *add;
         return true;
     }
+    if ((strcmp(name, "and") == 0 || strcmp(name, "or") == 0) && n == 2)
+    {
+        AstExpr *e = mkBinary(compiler, loc,
+                              (name[0] == 'a') ? BINOP_LOGICAL_AND : BINOP_LOGICAL_OR, p[0], p[1]);
+        *expr = *e;
+        return true;
+    }
+    if (strcmp(name, "select") == 0 && n == 3)
+    {
+        AstExpr *e = NEW(compiler, AstExpr);
+        e->kind = EXPR_TERNARY;
+        e->loc = loc;
+        e->ternary.cond = p[0];
+        e->ternary.true_expr = p[1];
+        e->ternary.false_expr = p[2];
+        *expr = *e;
+        return true;
+    }
     if (strcmp(name, "rcp") == 0 && n == 1)
     {
         AstExpr *div = mkBinary(compiler, loc, BINOP_DIV, mkFloatLit(compiler, loc, 1.0), p[0]);
@@ -1152,6 +1178,64 @@ static bool desugarIntrinsic(TsCompiler *compiler, AstExpr *expr)
     return false;
 }
 
+
+static bool isNumericOrBool(AstType *t)
+{
+    return t && (t->kind == TYPE_FLOAT || t->kind == TYPE_INT || t->kind == TYPE_BOOL);
+}
+
+// C-style casts. Scalars/vectors convert element-wise, a scalar splats to a
+// vector, a vector truncates to a smaller vector or scalar, and "(Struct)0"
+// zero-initializes. All of these lower through EXPR_AUTO_CAST.
+static void analyzerAnalyzeCast(Analyzer *a, AstExpr *expr, AstType *target)
+{
+    TsCompiler *compiler = a->compiler;
+    AstExpr *operand = expr->func_call.params.ptr[0];
+    analyzerAnalyzeExpr(a, operand, NULL);
+    expr->type = NULL;
+    if (!operand->type) return;
+
+    AstType *src = operand->type;
+    AstType *src_scalar = (src->kind == TYPE_VECTOR) ? src->vector.elem_type : src;
+    AstType *dst_scalar = (target->kind == TYPE_VECTOR) ? target->vector.elem_type : target;
+
+    bool ok = false;
+    if (src_scalar && dst_scalar && isNumericOrBool(src_scalar) && isNumericOrBool(dst_scalar))
+    {
+        uint32_t src_n = (src->kind == TYPE_VECTOR) ? src->vector.size : 1;
+        uint32_t dst_n = (target->kind == TYPE_VECTOR) ? target->vector.size : 1;
+        // splat (1 -> n), same size, or truncation (n -> fewer)
+        ok = (src_n == 1) || (src_n >= dst_n);
+    }
+    else if (target->kind == TYPE_STRUCT || target->kind == TYPE_ARRAY || target->kind == TYPE_MATRIX)
+    {
+        // Only "(T)0" is supported: zero-initialization
+        ok = operand->resolved_int && *operand->resolved_int == 0;
+        if (!ok)
+        {
+            ts__addErr(compiler, &expr->loc,
+                       "only '(T)0' zero-initialization casts are supported for this type");
+            return;
+        }
+    }
+    else if (src == target)
+    {
+        ok = true;
+    }
+
+    if (!ok)
+    {
+        ts__addErr(compiler, &expr->loc, "invalid cast");
+        return;
+    }
+
+    Location loc = expr->loc;
+    memset(expr, 0, sizeof(*expr));
+    expr->kind = EXPR_AUTO_CAST;
+    expr->loc = loc;
+    expr->auto_cast.sub = operand;
+    expr->type = target;
+}
 
 // Wraps an already-analyzed expression in an implicit conversion to 'type'.
 static void wrapAutoCastM(TsCompiler *compiler, AstExpr *expr, AstType *type)
@@ -1456,6 +1540,11 @@ static void analyzerAnalyzeExpr(Analyzer *a, AstExpr *expr, AstType *expected_ty
 
             case TOKEN_UINT: {
                 elem_type = newIntType(a->module, 32, false);
+                break;
+            }
+
+            case TOKEN_BOOL: {
+                elem_type = newBasicType(a->module, TYPE_BOOL);
                 break;
             }
 
@@ -1886,6 +1975,41 @@ static void analyzerAnalyzeExpr(Analyzer *a, AstExpr *expr, AstType *expected_ty
 
             switch (builtin_func_kind)
             {
+            case AST_BUILTIN_FUNC_ANY:
+            case AST_BUILTIN_FUNC_ALL:
+            case AST_BUILTIN_FUNC_ISNAN:
+            case AST_BUILTIN_FUNC_ISINF: {
+                if (param_count != 1)
+                {
+                    ts__addErr(compiler, &expr->loc, "this function takes 1 parameter");
+                    break;
+                }
+                AstExpr *arg = params.ptr[0];
+                if (!arg->type) break;
+
+                AstType *elem = (arg->type->kind == TYPE_VECTOR) ? arg->type->vector.elem_type
+                                                                 : arg->type;
+                bool is_test = builtin_func_kind == AST_BUILTIN_FUNC_ISNAN ||
+                               builtin_func_kind == AST_BUILTIN_FUNC_ISINF;
+                bool ok = is_test ? elem->kind == TYPE_FLOAT
+                                  : (elem->kind == TYPE_FLOAT || elem->kind == TYPE_INT ||
+                                     elem->kind == TYPE_BOOL);
+                if (!ok)
+                {
+                    ts__addErr(compiler, &arg->loc,
+                               is_test ? "expected a float scalar or vector"
+                                       : "expected a scalar or vector");
+                    break;
+                }
+
+                AstType *bool_type = newBasicType(m, TYPE_BOOL);
+                if (is_test && arg->type->kind == TYPE_VECTOR)
+                    expr->type = newVectorType(m, bool_type, arg->type->vector.size);
+                else
+                    expr->type = bool_type;
+                break;
+            }
+
             case AST_BUILTIN_FUNC_DOT: {
                 if (param_count != 2)
                 {
@@ -1987,49 +2111,38 @@ static void analyzerAnalyzeExpr(Analyzer *a, AstExpr *expr, AstType *expected_ty
             case AST_BUILTIN_FUNC_MUL: {
                 if (param_count != 2)
                 {
-                    ts__addErr(compiler, &expr->loc, "dot needs 2 parameters");
+                    ts__addErr(compiler, &expr->loc, "mul needs 2 parameters");
                     break;
                 }
-
                 AstExpr *a = params.ptr[0];
                 AstExpr *b = params.ptr[1];
+                if (!a->type || !b->type) break;
 
-                if (!((a->type->kind == TYPE_VECTOR && b->type->kind == TYPE_MATRIX) ||
-                      (a->type->kind == TYPE_MATRIX && b->type->kind == TYPE_VECTOR) ||
-                      (a->type->kind == TYPE_VECTOR && b->type->kind == TYPE_VECTOR) ||
-                      (a->type->kind == TYPE_MATRIX && b->type->kind == TYPE_MATRIX)))
-                {
-                    ts__addErr(compiler, &expr->loc, "invalid parameters for mul");
-                    break;
-                }
-
+                // HLSL floatRxC is stored as a SPIR-V matrix of R columns, each a
+                // C-vector (the transpose), so col_count = R and col_type = vector(C).
                 if (a->type->kind == TYPE_VECTOR && b->type->kind == TYPE_MATRIX)
                 {
-                    // Matrix times vector, yes, it's backwards
-                    if (a->type != b->type->matrix.col_type)
+                    // row vector (R) * matrix (RxC) -> vector (C)
+                    if (a->type->vector.size != b->type->matrix.col_count ||
+                        a->type->vector.elem_type != b->type->matrix.col_type->vector.elem_type)
                     {
-                        ts__addErr(
-                            compiler,
-                            &expr->loc,
-                            "mismatched matrix columns with vector type");
+                        ts__addErr(compiler, &expr->loc,
+                                   "mul: vector size must match the matrix row count");
                         break;
                     }
-
-                    expr->type = a->type;
+                    expr->type = b->type->matrix.col_type;
                 }
                 else if (a->type->kind == TYPE_MATRIX && b->type->kind == TYPE_VECTOR)
                 {
-                    // Vector times matrix, yes, it's backwards
+                    // matrix (RxC) * column vector (C) -> vector (R)
                     if (b->type != a->type->matrix.col_type)
                     {
-                        ts__addErr(
-                            compiler,
-                            &expr->loc,
-                            "mismatched matrix columns with vector type");
+                        ts__addErr(compiler, &expr->loc,
+                                   "mul: vector size must match the matrix column count");
                         break;
                     }
-
-                    expr->type = b->type;
+                    expr->type = newVectorType(
+                        m, a->type->matrix.col_type->vector.elem_type, a->type->matrix.col_count);
                 }
                 else if (a->type->kind == TYPE_VECTOR && b->type->kind == TYPE_VECTOR)
                 {
@@ -2039,28 +2152,27 @@ static void analyzerAnalyzeExpr(Analyzer *a, AstExpr *expr, AstType *expected_ty
                         ts__addErr(compiler, &expr->loc, "mismatched vector types");
                         break;
                     }
-
                     expr->type = a->type->vector.elem_type;
                 }
                 else if (a->type->kind == TYPE_MATRIX && b->type->kind == TYPE_MATRIX)
                 {
-                    // Matrix times matrix
-                    if (b->type != a->type)
+                    // (RxK) * (KxC) -> (RxC)
+                    AstType *ac = a->type->matrix.col_type;
+                    AstType *bc = b->type->matrix.col_type;
+                    if (ac->vector.size != b->type->matrix.col_count ||
+                        ac->vector.elem_type != bc->vector.elem_type)
                     {
-                        ts__addErr(compiler, &expr->loc, "mismatched matrix types");
+                        ts__addErr(compiler, &expr->loc, "mul: mismatched matrix dimensions");
                         break;
                     }
-
-                    expr->type = a->type;
+                    expr->type = newMatrixType(m, bc, a->type->matrix.col_count);
                 }
                 else
                 {
-                    TS_ASSERT(0);
+                    ts__addErr(compiler, &expr->loc, "invalid parameters for mul");
                 }
-
                 break;
             }
-
             case AST_BUILTIN_FUNC_DISTANCE: {
                 if (param_count != 2)
                 {
@@ -3334,6 +3446,12 @@ static void analyzerAnalyzeExpr(Analyzer *a, AstExpr *expr, AstType *expected_ty
             AstType *constructed_type = func_expr->as_type;
             TS_ASSERT(constructed_type);
 
+            if (expr->func_call.is_cast)
+            {
+                analyzerAnalyzeCast(a, expr, constructed_type);
+                break;
+            }
+
             expr->type = constructed_type;
 
             uint32_t param_count = arrLength(expr->func_call.params);
@@ -3365,7 +3483,22 @@ static void analyzerAnalyzeExpr(Analyzer *a, AstExpr *expr, AstType *expected_ty
                     tryCoerceExprToScalarType(a, params.ptr[i], wanted_elem_type);
                     if (!params.ptr[i]->type) continue;
 
-                    if (ts__getScalarType(params.ptr[i]->type) != wanted_elem_type)
+                    // Scalars convert implicitly to the element type, as in HLSL
+                    AstType *param_type = params.ptr[i]->type;
+                    if (param_type->kind != TYPE_VECTOR && param_type != wanted_elem_type &&
+                        isTypeCastable(param_type, wanted_elem_type))
+                    {
+                        wrapAutoCast(a, params.ptr[i], wanted_elem_type);
+                    }
+                    else if (param_type->kind == TYPE_VECTOR &&
+                             param_type->vector.elem_type != wanted_elem_type &&
+                             isTypeCastable(param_type->vector.elem_type, wanted_elem_type))
+                    {
+                        wrapAutoCast(a, params.ptr[i],
+                                     newVectorType(m, wanted_elem_type, param_type->vector.size));
+                    }
+
+                    if (ts__getElemType(params.ptr[i]->type) != wanted_elem_type)
                     {
                         ts__addErr(
                             compiler,
@@ -3720,12 +3853,13 @@ static void analyzerAnalyzeExpr(Analyzer *a, AstExpr *expr, AstType *expected_ty
         }
 
         case UNOP_NOT: {
+            // '!' converts its operand to bool (component-wise) and negates
             analyzerAnalyzeExpr(a, expr->unary.right, NULL);
             if (!expr->unary.right->type) break;
             AstType *right_type = expr->unary.right->type;
-            AstType *logical_type = ts__getLogicalType(right_type);
+            AstType *elem = ts__getElemType(right_type);
 
-            if (!logical_type)
+            if (elem->kind != TYPE_BOOL && elem->kind != TYPE_INT && elem->kind != TYPE_FLOAT)
             {
                 ts__addErr(
                     compiler,
@@ -3734,7 +3868,11 @@ static void analyzerAnalyzeExpr(Analyzer *a, AstExpr *expr, AstType *expected_ty
                 break;
             }
 
-            expr->type = right_type;
+            AstType *bool_type = newBasicType(m, TYPE_BOOL);
+            AstType *target = (right_type->kind == TYPE_VECTOR)
+                ? newVectorType(m, bool_type, right_type->vector.size) : bool_type;
+            wrapAutoCast(a, expr->unary.right, target);
+            expr->type = target;
 
             break;
         }
@@ -3916,8 +4054,27 @@ static void analyzerAnalyzeExpr(Analyzer *a, AstExpr *expr, AstType *expected_ty
             AstType *left_type = expr->binary.left->type;
             AstType *right_type = expr->binary.right->type;
 
-            AstType *left_comparable = ts__getComparableType(left_type);
-            AstType *right_comparable = ts__getComparableType(right_type);
+            if (!left_type || !right_type) break;
+
+            // Vector comparisons are component-wise and give a bool vector;
+            // a scalar operand is splatted to the other side's size.
+            if (left_type->kind == TYPE_VECTOR && right_type->kind != TYPE_VECTOR &&
+                ts__getComparableType(right_type))
+            {
+                wrapAutoCast(a, expr->binary.right,
+                             newVectorType(m, right_type, left_type->vector.size));
+                right_type = expr->binary.right->type;
+            }
+            else if (right_type->kind == TYPE_VECTOR && left_type->kind != TYPE_VECTOR &&
+                     ts__getComparableType(left_type))
+            {
+                wrapAutoCast(a, expr->binary.left,
+                             newVectorType(m, left_type, right_type->vector.size));
+                left_type = expr->binary.left->type;
+            }
+
+            AstType *left_comparable = ts__getComparableType(ts__getElemType(left_type));
+            AstType *right_comparable = ts__getComparableType(ts__getElemType(right_type));
 
             if ((!left_comparable) || (!right_comparable) || (left_type != right_type))
             {
@@ -3927,7 +4084,10 @@ static void analyzerAnalyzeExpr(Analyzer *a, AstExpr *expr, AstType *expected_ty
                     "invalid types for binary comparison operation");
             }
 
-            expr->type = newBasicType(m, TYPE_BOOL);
+            if (left_type->kind == TYPE_VECTOR)
+                expr->type = newVectorType(m, newBasicType(m, TYPE_BOOL), left_type->vector.size);
+            else
+                expr->type = newBasicType(m, TYPE_BOOL);
 
             break;
         }
@@ -3984,16 +4144,47 @@ static void analyzerAnalyzeExpr(Analyzer *a, AstExpr *expr, AstType *expected_ty
         case BINOP_LOGICAL_AND:
         case BINOP_LOGICAL_OR: {
             AstType *bool_type = newBasicType(m, TYPE_BOOL);
+            AstExpr *l = expr->binary.left;
+            AstExpr *r = expr->binary.right;
 
-            analyzerAnalyzeExpr(a, expr->binary.left, bool_type);
-            analyzerAnalyzeExpr(a, expr->binary.right, bool_type);
+            analyzerAnalyzeExpr(a, l, NULL);
+            analyzerAnalyzeExpr(a, r, NULL);
+            if (!l->type || !r->type) break;
 
-            expr->type = bool_type;
+            // and()/or() (and && / || on vectors) work component-wise
+            uint32_t size = 0;
+            if (l->type->kind == TYPE_VECTOR) size = l->type->vector.size;
+            if (r->type->kind == TYPE_VECTOR)
+            {
+                if (size && size != r->type->vector.size)
+                {
+                    ts__addErr(compiler, &expr->loc, "logical operands have different sizes");
+                    break;
+                }
+                size = r->type->vector.size;
+            }
+
+            AstType *target = size ? newVectorType(m, bool_type, size) : bool_type;
+            AstExpr *sides[2] = {l, r};
+            for (int i = 0; i < 2; ++i)
+            {
+                AstType *e = ts__getElemType(sides[i]->type);
+                if (e->kind != TYPE_BOOL && e->kind != TYPE_INT && e->kind != TYPE_FLOAT)
+                {
+                    ts__addErr(compiler, &sides[i]->loc, "expected a boolean value");
+                    continue;
+                }
+                wrapAutoCast(a, sides[i], target);
+            }
+
+            expr->type = target;
             break;
         }
         }
 
-        if (expr->binary.left->resolved_int && expr->binary.right->resolved_int)
+        if (expr->binary.left->resolved_int && expr->binary.right->resolved_int &&
+            !((expr->binary.op == BINOP_DIV || expr->binary.op == BINOP_MOD) &&
+              *expr->binary.right->resolved_int == 0))
         {
             int64_t left_int = *expr->binary.left->resolved_int;
             int64_t right_int = *expr->binary.right->resolved_int;
@@ -4026,11 +4217,46 @@ static void analyzerAnalyzeExpr(Analyzer *a, AstExpr *expr, AstType *expected_ty
     }
 
     case EXPR_TERNARY: {
-        analyzerAnalyzeExpr(a, expr->ternary.cond, newBasicType(m, TYPE_BOOL));
-        analyzerAnalyzeExpr(a, expr->ternary.true_expr, expected_type);
-        analyzerAnalyzeExpr(a, expr->ternary.false_expr, expr->ternary.true_expr->type);
+        AstExpr *cond = expr->ternary.cond;
+        analyzerAnalyzeExpr(a, cond, NULL);
+        if (!cond->type) break;
 
-        expr->type = expr->ternary.true_expr->type;
+        // A vector condition selects component-wise (also used by select()).
+        uint32_t cond_size = (cond->type->kind == TYPE_VECTOR) ? cond->type->vector.size : 0;
+        AstType *bool_type = newBasicType(m, TYPE_BOOL);
+        AstType *cond_target = cond_size ? newVectorType(m, bool_type, cond_size) : bool_type;
+        if (cond->type != cond_target)
+        {
+            AstType *ce = ts__getElemType(cond->type);
+            if (ce->kind != TYPE_FLOAT && ce->kind != TYPE_INT && ce->kind != TYPE_BOOL)
+            {
+                ts__addErr(compiler, &cond->loc, "condition must be a scalar or vector");
+                break;
+            }
+            wrapAutoCast(a, cond, cond_target);
+        }
+
+        AstType *want = expected_type;
+        analyzerAnalyzeExpr(a, expr->ternary.true_expr, want);
+        AstType *true_type = expr->ternary.true_expr->type;
+        if (!true_type) break;
+
+        if (cond_size && true_type->kind != TYPE_VECTOR)
+        {
+            // select(mask3, 1.0, 0.0): splat the scalar branches
+            AstType *vec = newVectorType(m, true_type, cond_size);
+            wrapAutoCast(a, expr->ternary.true_expr, vec);
+            true_type = vec;
+        }
+
+        analyzerAnalyzeExpr(a, expr->ternary.false_expr, true_type);
+
+        if (cond_size && true_type->kind == TYPE_VECTOR && true_type->vector.size != cond_size)
+        {
+            ts__addErr(compiler, &cond->loc, "condition size doesn't match the result size");
+        }
+
+        expr->type = true_type;
         break;
     }
 

@@ -89,6 +89,7 @@ static TsCompiler *ts__CompilerCreate(void)
     ts__hashSet(&compiler->keyword_table, "uint", (void *)TOKEN_UINT);
     ts__hashSet(&compiler->keyword_table, "int", (void *)TOKEN_INT);
     ts__hashSet(&compiler->keyword_table, "float", (void *)TOKEN_FLOAT);
+    ts__hashSet(&compiler->keyword_table, "half", (void *)TOKEN_FLOAT);
     ts__hashSet(&compiler->keyword_table, "bool", (void *)TOKEN_BOOL);
     ts__hashSet(&compiler->keyword_table, "true", (void *)TOKEN_TRUE);
     ts__hashSet(&compiler->keyword_table, "false", (void *)TOKEN_FALSE);
@@ -140,6 +141,10 @@ static TsCompiler *ts__CompilerCreate(void)
     ts__hashSet(&compiler->builtin_function_table, "floor", (void *)AST_BUILTIN_FUNC_FLOOR);
     ts__hashSet(&compiler->builtin_function_table, "round", (void *)AST_BUILTIN_FUNC_ROUND);
     ts__hashSet(&compiler->builtin_function_table, "sign", (void *)AST_BUILTIN_FUNC_SIGN);
+    ts__hashSet(&compiler->builtin_function_table, "any", (void *)AST_BUILTIN_FUNC_ANY);
+    ts__hashSet(&compiler->builtin_function_table, "all", (void *)AST_BUILTIN_FUNC_ALL);
+    ts__hashSet(&compiler->builtin_function_table, "isnan", (void *)AST_BUILTIN_FUNC_ISNAN);
+    ts__hashSet(&compiler->builtin_function_table, "isinf", (void *)AST_BUILTIN_FUNC_ISINF);
     ts__hashSet(&compiler->builtin_function_table, "lerp", (void *)AST_BUILTIN_FUNC_LERP);
     ts__hashSet(&compiler->builtin_function_table, "clamp", (void *)AST_BUILTIN_FUNC_CLAMP);
     ts__hashSet(&compiler->builtin_function_table, "step", (void *)AST_BUILTIN_FUNC_STEP);

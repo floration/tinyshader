@@ -60,6 +60,11 @@ static bool isTypeOpaque(IRType *type)
             type->kind == IR_TYPE_RUNTIME_ARRAY);
 }
 
+static bool isScalarAstType(AstType *t)
+{
+    return t->kind == TYPE_FLOAT || t->kind == TYPE_INT || t->kind == TYPE_BOOL;
+}
+
 static IRInst *loadVal(IRModule *m, IRInst *value)
 {
     TS_ASSERT(value);
@@ -891,7 +896,7 @@ static void astBuildExpr(Module *ast_mod, IRModule *ir_mod, AstExpr *expr)
                 break;
             }
 
-            case IR_BUILTIN_INTERLOCKED_COMPARE_EXCHANGE: {
+            case AST_BUILTIN_FUNC_INTERLOCKED_COMPARE_EXCHANGE: {
                 uint32_t ir_param_count = 7;
                 IRInst **ir_param_values = NEW_ARRAY(compiler, IRInst *, ir_param_count);
 
@@ -933,6 +938,40 @@ static void astBuildExpr(Module *ast_mod, IRModule *ir_mod, AstExpr *expr)
                     result_type,
                     ir_param_values,
                     ir_param_count);
+                break;
+            }
+
+            case AST_BUILTIN_FUNC_ANY:
+            case AST_BUILTIN_FUNC_ALL: {
+                IRInst *value = loadVal(ir_mod, param_values[0]);
+                IRType *bool_type = ts__irNewBasicType(ir_mod, IR_TYPE_BOOL);
+                IRType *elem = (value->type->kind == IR_TYPE_VECTOR) ? value->type->vector.elem_type
+                                                                     : value->type;
+                if (elem->kind != IR_TYPE_BOOL)
+                {
+                    IRType *as_bool = (value->type->kind == IR_TYPE_VECTOR)
+                        ? ts__irNewVectorType(ir_mod, bool_type, value->type->vector.size)
+                        : bool_type;
+                    value = ts__irBuildCast(ir_mod, as_bool, value);
+                }
+
+                if (value->type->kind == IR_TYPE_VECTOR)
+                {
+                    SpvOp op = (builtin_func_kind == AST_BUILTIN_FUNC_ANY) ? SpvOpAny : SpvOpAll;
+                    expr->value = ts__irBuildUnary(ir_mod, op, bool_type, value);
+                }
+                else
+                {
+                    expr->value = value;
+                }
+                break;
+            }
+
+            case AST_BUILTIN_FUNC_ISNAN:
+            case AST_BUILTIN_FUNC_ISINF: {
+                SpvOp op = (builtin_func_kind == AST_BUILTIN_FUNC_ISNAN) ? SpvOpIsNan : SpvOpIsInf;
+                IRType *result_type = convertTypeToIR(ast_mod, ir_mod, expr->type);
+                expr->value = ts__irBuildUnary(ir_mod, op, result_type, loadVal(ir_mod, param_values[0]));
                 break;
             }
 
@@ -1080,6 +1119,10 @@ static void astBuildExpr(Module *ast_mod, IRModule *ir_mod, AstExpr *expr)
                 case AST_BUILTIN_FUNC_DEVICE_MEMORY_BARRIER_WITH_GROUP_SYNC:
                 case AST_BUILTIN_FUNC_GROUP_MEMORY_BARRIER:
                 case AST_BUILTIN_FUNC_GROUP_MEMORY_BARRIER_WITH_GROUP_SYNC:
+                case AST_BUILTIN_FUNC_ANY:
+                case AST_BUILTIN_FUNC_ALL:
+                case AST_BUILTIN_FUNC_ISNAN:
+                case AST_BUILTIN_FUNC_ISINF:
                     TS_ASSERT(0);
                     break;
                 }
@@ -1453,13 +1496,12 @@ static void astBuildExpr(Module *ast_mod, IRModule *ir_mod, AstExpr *expr)
         }
 
         case UNOP_NOT: {
-            TS_ASSERT(0); // TODO: broken: use SpvINotEqual + SpvOpLogicalNot
-
+            // Analysis already converted the operand to bool
             astBuildExpr(ast_mod, ir_mod, expr->unary.right);
             IRInst *right_val = loadVal(ir_mod, expr->unary.right->value);
 
             IRType *ir_type = convertTypeToIR(ast_mod, ir_mod, expr->type);
-            expr->value = ts__irBuildUnary(ir_mod, SpvOpNot, ir_type, right_val);
+            expr->value = ts__irBuildUnary(ir_mod, SpvOpLogicalNot, ir_type, right_val);
             break;
         }
 
@@ -1723,6 +1765,7 @@ static void astBuildExpr(Module *ast_mod, IRModule *ir_mod, AstExpr *expr)
             {
             case TYPE_FLOAT: op = SpvOpFOrdEqual; break;
             case TYPE_INT: op = SpvOpIEqual; break;
+            case TYPE_BOOL: op = SpvOpLogicalEqual; break;
             default: TS_ASSERT(0); break;
             }
             break;
@@ -1731,8 +1774,9 @@ static void astBuildExpr(Module *ast_mod, IRModule *ir_mod, AstExpr *expr)
         case BINOP_NOTEQ: {
             switch (elem_type->kind)
             {
-            case TYPE_FLOAT: op = SpvOpFOrdNotEqual; break;
+            case TYPE_FLOAT: op = SpvOpFUnordNotEqual; break;
             case TYPE_INT: op = SpvOpINotEqual; break;
+            case TYPE_BOOL: op = SpvOpLogicalNotEqual; break;
             default: TS_ASSERT(0); break;
             }
             break;
@@ -1844,7 +1888,7 @@ static void astBuildExpr(Module *ast_mod, IRModule *ir_mod, AstExpr *expr)
         astBuildExpr(ast_mod, ir_mod, expr->ternary.false_expr);
         IRInst *false_value = loadVal(ir_mod, expr->ternary.false_expr->value);
 
-        if (ir_type->kind == IR_TYPE_VECTOR)
+        if (ir_type->kind == IR_TYPE_VECTOR && cond->type->kind != IR_TYPE_VECTOR)
         {
             IRInst **fields = NEW_ARRAY(ir_mod->compiler, IRInst *, ir_type->vector.size);
             for (uint32_t i = 0; i < ir_type->vector.size; ++i)
@@ -1863,8 +1907,44 @@ static void astBuildExpr(Module *ast_mod, IRModule *ir_mod, AstExpr *expr)
 
     case EXPR_AUTO_CAST:
     {
-        if (expr->type->kind == TYPE_VECTOR &&
-            ts__getScalarTypeNoVec(expr->auto_cast.sub->type))
+        AstType *sub_type = expr->auto_cast.sub->type;
+        AstType *dst_elem =
+            (expr->type->kind == TYPE_VECTOR) ? expr->type->vector.elem_type : expr->type;
+        bool dst_is_value = dst_elem->kind == TYPE_FLOAT || dst_elem->kind == TYPE_INT ||
+                            dst_elem->kind == TYPE_BOOL;
+
+        if (!dst_is_value)
+        {
+            // "(Struct)0" and friends: zero-initialize
+            IRType *ir_type = convertTypeToIR(ast_mod, ir_mod, expr->type);
+            expr->value = ts__irBuildZeroValue(ir_mod, ir_type);
+        }
+        else if (sub_type->kind == TYPE_VECTOR &&
+                 (expr->type->kind != TYPE_VECTOR ||
+                  expr->type->vector.size < sub_type->vector.size))
+        {
+            // Truncating cast: keep the leading components
+            astBuildExpr(ast_mod, ir_mod, expr->auto_cast.sub);
+            IRInst *value = loadVal(ir_mod, expr->auto_cast.sub->value);
+
+            if (expr->type->kind != TYPE_VECTOR)
+            {
+                uint32_t index = 0;
+                value = ts__irBuildCompositeExtract(ir_mod, value, &index, 1);
+            }
+            else
+            {
+                uint32_t n = expr->type->vector.size;
+                uint32_t *indices = NEW_ARRAY(compiler, uint32_t, n);
+                for (uint32_t i = 0; i < n; ++i) indices[i] = i;
+                value = ts__irBuildVectorShuffle(ir_mod, value, value, indices, n);
+            }
+
+            IRType *dst_type = convertTypeToIR(ast_mod, ir_mod, expr->type);
+            expr->value = (value->type == dst_type) ? value
+                                                    : ts__irBuildCast(ir_mod, dst_type, value);
+        }
+        else if (expr->type->kind == TYPE_VECTOR && isScalarAstType(expr->auto_cast.sub->type))
         {
             astBuildExpr(ast_mod, ir_mod, expr->auto_cast.sub);
             IRInst *value = loadVal(ir_mod, expr->auto_cast.sub->value);
@@ -1890,8 +1970,7 @@ static void astBuildExpr(Module *ast_mod, IRModule *ir_mod, AstExpr *expr)
                 fields,
                 field_count);
         }
-        else if (ts__getScalarTypeNoVec(expr->type) &&
-                 ts__getScalarTypeNoVec(expr->auto_cast.sub->type))
+        else if (isScalarAstType(expr->type) && isScalarAstType(expr->auto_cast.sub->type))
         {
             // Cast scalar
             astBuildExpr(ast_mod, ir_mod, expr->auto_cast.sub);
@@ -2564,6 +2643,42 @@ static bool astSemanticToDecoration(
     return true;
 }
 
+// Interpolation decorations for a stage input/output. Integer (and bool)
+// fragment inputs must be flat in Vulkan whether or not they say so.
+static void astApplyInterpolation(Module *ast_mod, IRModule *ir_mod, IRInst *value, AstDecl *decl)
+{
+    uint32_t interp = decl->interpolation;
+    AstType *elem = ts__getElemType(decl->type);
+    bool is_frag_input = ast_mod->stage == TS_SHADER_STAGE_FRAGMENT;
+
+    if ((interp & INTERP_NOINTERPOLATION) ||
+        (is_frag_input && elem && (elem->kind == TYPE_INT || elem->kind == TYPE_BOOL)))
+    {
+        IRDecoration d = {0};
+        d.kind = SpvDecorationFlat;
+        ts__irDecorateInst(ir_mod, value, &d);
+    }
+    if (interp & INTERP_NOPERSPECTIVE)
+    {
+        IRDecoration d = {0};
+        d.kind = SpvDecorationNoPerspective;
+        ts__irDecorateInst(ir_mod, value, &d);
+    }
+    if (interp & INTERP_CENTROID)
+    {
+        IRDecoration d = {0};
+        d.kind = SpvDecorationCentroid;
+        ts__irDecorateInst(ir_mod, value, &d);
+    }
+    if (interp & INTERP_SAMPLE)
+    {
+        IRDecoration d = {0};
+        d.kind = SpvDecorationSample;
+        ts__irDecorateInst(ir_mod, value, &d);
+        if (is_frag_input) ir_mod->uses_sample_rate_shading = true;
+    }
+}
+
 static void astRecursivelyAddOutputs(
     Module *ast_mod,
     IRModule *ir_mod,
@@ -2666,6 +2781,13 @@ static void astRecursivelyAddOutputs(
 
             ts__irDecorateInst(ir_mod, value, &dec);
 
+            // Interpolation modifiers on vertex outputs, as DXC emits them
+            if (ast_mod->stage == TS_SHADER_STAGE_VERTEX && dec.kind == SpvDecorationLocation &&
+                decl->interpolation)
+            {
+                astApplyInterpolation(ast_mod, ir_mod, value, decl);
+            }
+
             arrPush(compiler, values, value);
         }
         break;
@@ -2739,15 +2861,9 @@ static void astRecursivelyAddInputs(
 
             ts__irDecorateInst(ir_mod, value, &dec);
 
-            // Vulkan requires integer fragment inputs to be flat-interpolated
-            AstType *scalar = ts__getScalarType(decl->type);
-            if (ast_mod->stage == TS_SHADER_STAGE_FRAGMENT &&
-                dec.kind == SpvDecorationLocation && scalar &&
-                (scalar->kind == TYPE_INT || scalar->kind == TYPE_BOOL))
+            if (ast_mod->stage == TS_SHADER_STAGE_FRAGMENT && dec.kind == SpvDecorationLocation)
             {
-                IRDecoration flat = {0};
-                flat.kind = SpvDecorationFlat;
-                ts__irDecorateInst(ir_mod, value, &flat);
+                astApplyInterpolation(ast_mod, ir_mod, value, decl);
             }
 
             arrPush(compiler, values, value);

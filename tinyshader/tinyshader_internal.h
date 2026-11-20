@@ -802,6 +802,7 @@ struct IRModule
     bool uses_image_query;
     bool uses_descriptor_indexing;
     bool uses_runtime_descriptor_array;
+    bool uses_sample_rate_shading;
 
     IRInst *current_block;
 
@@ -857,6 +858,10 @@ typedef enum AstBuiltinFunction {
     AST_BUILTIN_FUNC_FLOOR,
     AST_BUILTIN_FUNC_ROUND,
     AST_BUILTIN_FUNC_SIGN,
+    AST_BUILTIN_FUNC_ANY,
+    AST_BUILTIN_FUNC_ALL,
+    AST_BUILTIN_FUNC_ISNAN,
+    AST_BUILTIN_FUNC_ISINF,
     AST_BUILTIN_FUNC_LERP,
     AST_BUILTIN_FUNC_CLAMP,
     AST_BUILTIN_FUNC_STEP,
@@ -1162,8 +1167,17 @@ struct AstStmt
     };
 };
 
+typedef enum AstInterpolation {
+    INTERP_NOINTERPOLATION = 1 << 0,
+    INTERP_NOPERSPECTIVE = 1 << 1,
+    INTERP_CENTROID = 1 << 2,
+    INTERP_SAMPLE = 1 << 3,
+    INTERP_LINEAR = 1 << 4, // the default; accepted and ignored
+} AstInterpolation;
+
 struct AstDecl
 {
+    uint32_t interpolation; // AstInterpolation flags
     AstDeclKind kind;
     Location loc;
     char *name;
@@ -1269,6 +1283,7 @@ struct AstExpr
             AstExpr *func_expr;
             ArrayOfAstExprPtr params;
             AstExpr *self_param;
+            bool is_cast; // C-style cast: (type)expr
         } func_call;
 
         struct
@@ -1562,6 +1577,7 @@ void ts__irBuildCondBr(
     IRInst *continue_block);
 void ts__irBuildUnreachable(IRModule *m);
 IRInst *ts__irConvertLayout(IRModule *m, IRInst *value, IRType *dst_type);
+IRInst *ts__irBuildZeroValue(IRModule *m, IRType *type);
 void ts__irBuildSwitch(
     IRModule *m,
     IRInst *selector,

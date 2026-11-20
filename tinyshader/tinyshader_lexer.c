@@ -464,12 +464,14 @@ ArrayOfToken ts__lex(TsCompiler *compiler, File *file, const char *text, size_t 
                 {
                     l->token.kind = TOKEN_IDENT;
 
-                    char *type_prefixes[3] = {"float", "uint", "int"};
-                    TokenKind type_kinds[3] = {TOKEN_FLOAT, TOKEN_UINT, TOKEN_INT};
+                    // "half" is 32-bit float, as in DXC without -enable-16bit-types
+                    char *type_prefixes[5] = {"float", "uint", "int", "bool", "half"};
+                    TokenKind type_kinds[5] = {
+                        TOKEN_FLOAT, TOKEN_UINT, TOKEN_INT, TOKEN_BOOL, TOKEN_FLOAT};
                     char *type_str = l->token.str;
                     size_t type_str_len = strlen(type_str);
 
-                    for (uint32_t i = 0; i < 3; ++i)
+                    for (uint32_t i = 0; i < 5; ++i)
                     {
                         size_t prefix_len = strlen(type_prefixes[i]);
                         if (strncmp(type_str, type_prefixes[i], prefix_len) == 0)
@@ -486,7 +488,7 @@ ArrayOfToken ts__lex(TsCompiler *compiler, File *file, const char *text, size_t 
                             }
 
                             if ((prefix_len + 3) == type_str_len &&
-                                type_str[prefix_len + 1] == 'x')
+                                type_str[prefix_len + 1] == 'x' && type_kinds[i] != TOKEN_BOOL)
                             {
                                 // Matrix type
                                 uint8_t dim1 = (uint8_t)(type_str[prefix_len + 2] - '0');
