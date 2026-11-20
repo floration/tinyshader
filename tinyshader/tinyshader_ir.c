@@ -128,7 +128,10 @@ static char *irTypeToString(TsCompiler *compiler, IRType *type)
         const char *size_str = irConstToString(compiler, type->array.size);
 
         ts__sbReset(&compiler->sb);
-        ts__sbSprintf(&compiler->sb, "array[%s]", size_str);
+        if (type->array.stride)
+            ts__sbSprintf(&compiler->sb, "array[%s]s%u", size_str, type->array.stride);
+        else
+            ts__sbSprintf(&compiler->sb, "array[%s]", size_str);
         prefix = ts__sbBuild(&compiler->sb, &compiler->alloc);
 
         TS_ASSERT(type->array.sub);
@@ -419,6 +422,28 @@ IRType *ts__irNewArrayType(IRModule *m, IRType *sub, IRInst *size)
     ty->array.sub = sub;
     ty->array.size = size;
     return irGetCachedType(m, ty);
+}
+
+// An array type carrying an ArrayStride, for use inside buffer layouts.
+// It is a distinct type from the plain array, which Function and
+// Workgroup variables must use (they may not have explicit layout).
+IRType *ts__irNewLaidOutArrayType(IRModule *m, IRType *sub, IRInst *size, uint32_t stride)
+{
+    TS_ASSERT(sub);
+    TS_ASSERT(size);
+
+    IRType *ty = NEW(m->compiler, IRType);
+    ty->kind = IR_TYPE_ARRAY;
+    ty->array.sub = sub;
+    ty->array.size = size;
+    ty->array.stride = stride;
+    ty = irGetCachedType(m, ty);
+
+    IRDecoration dec = {0};
+    dec.kind = SpvDecorationArrayStride;
+    dec.value = stride;
+    ts__irDecorateType(m, ty, &dec);
+    return ty;
 }
 
 IRType *
@@ -939,10 +964,39 @@ IRInst *ts__irBuildAlloca(IRModule *m, IRType *type)
     return inst;
 }
 
+// Rebuilds an array value as an equivalent array type that differs only in
+// explicit layout (ArrayStride), element by element.
+static IRInst *irConvertArrayLayout(IRModule *m, IRInst *value, IRType *dst_type)
+{
+    IRType *src_type = value->type;
+    if (src_type == dst_type) return value;
+    if (src_type->kind != IR_TYPE_ARRAY || dst_type->kind != IR_TYPE_ARRAY) return value;
+    if (src_type->array.size != dst_type->array.size) return value;
+
+    IRInst *size = src_type->array.size;
+    uint32_t count = 0;
+    memcpy(&count, size->constant.value,
+           size->constant.value_size_bytes < 4 ? size->constant.value_size_bytes : 4);
+
+    IRInst **elems = NEW_ARRAY(m->compiler, IRInst *, count);
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        uint32_t index = i;
+        IRInst *elem = ts__irBuildCompositeExtract(m, value, &index, 1);
+        elems[i] = irConvertArrayLayout(m, elem, dst_type->array.sub);
+    }
+    return ts__irBuildCompositeConstruct(m, dst_type, elems, count);
+}
+
 void ts__irBuildStore(IRModule *m, IRInst *pointer, IRInst *value)
 {
     TS_ASSERT(pointer);
     TS_ASSERT(value);
+
+    if (pointer->type && pointer->type->kind == IR_TYPE_POINTER && value->type)
+    {
+        value = irConvertArrayLayout(m, value, pointer->type->ptr.sub);
+    }
 
     IRInst *inst = NEW(m->compiler, IRInst);
     inst->kind = IR_INST_STORE;
@@ -976,9 +1030,39 @@ IRInst *ts__irBuildAccessChain(
     IRInst *inst = NEW(m->compiler, IRInst);
     inst->kind = IR_INST_ACCESS_CHAIN;
 
-    inst->type = ts__irNewPointerType(m, base->type->ptr.storage_class, type);
-
     TS_ASSERT(base->type->kind == IR_TYPE_POINTER);
+
+    // Derive the exact result type from the base type, so that members with
+    // explicit layout (e.g. strided arrays in buffers) keep their own type id.
+    IRType *walked = base->type->ptr.sub;
+    for (uint32_t i = 0; walked && i < index_count; ++i)
+    {
+        switch (walked->kind)
+        {
+        case IR_TYPE_STRUCT: {
+            IRInst *idx = indices[i];
+            if (idx->kind != IR_INST_CONSTANT || !idx->constant.value)
+            {
+                walked = NULL;
+                break;
+            }
+            uint32_t member = 0;
+            memcpy(&member, idx->constant.value,
+                   idx->constant.value_size_bytes < 4 ? idx->constant.value_size_bytes : 4);
+            walked = (member < walked->struct_.field_count) ? walked->struct_.fields[member]
+                                                            : NULL;
+            break;
+        }
+        case IR_TYPE_ARRAY:
+        case IR_TYPE_RUNTIME_ARRAY: walked = walked->array.sub; break;
+        case IR_TYPE_VECTOR: walked = walked->vector.elem_type; break;
+        case IR_TYPE_MATRIX: walked = walked->matrix.col_type; break;
+        default: walked = NULL; break;
+        }
+    }
+    if (walked) type = walked;
+
+    inst->type = ts__irNewPointerType(m, base->type->ptr.storage_class, type);
 
     inst->access_chain.base = base;
     inst->access_chain.index_count = index_count;
@@ -1049,6 +1133,10 @@ IRInst *ts__irBuildCompositeExtract(
         {
             TS_ASSERT(0);
         }
+    }
+    else if (value->type->kind == IR_TYPE_ARRAY && index_count == 1)
+    {
+        inst->type = value->type->array.sub;
     }
     else
     {
@@ -1542,6 +1630,10 @@ static void irModuleEncodeDecorations(IRModule *m)
             switch (dec->kind)
             {
             case SpvDecorationBlock: TS_ASSERT(0); break;
+            case SpvDecorationFlat:
+            case SpvDecorationNoPerspective:
+            case SpvDecorationCentroid:
+            case SpvDecorationSample: param_count = 2; break;
             default: break;
             }
             irModuleEncodeInst(m, SpvOpDecorate, params, param_count);

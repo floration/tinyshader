@@ -195,7 +195,20 @@ static IRType *convertTypeToIR(Module *module, IRModule *ir_module, AstType *typ
             NEW_ARRAY(module->compiler, IRType *, type->struct_.field_count);
         for (uint32_t i = 0; i < type->struct_.field_count; ++i)
         {
-            field_types[i] = convertTypeToIR(module, ir_module, type->struct_.fields[i]);
+            AstType *field = type->struct_.fields[i];
+            if (field->kind == TYPE_ARRAY && field->size > 0)
+            {
+                // Struct members get explicit (std140) array layout
+                IRType *size_type = ts__irNewIntType(ir_module, 32, false);
+                IRInst *size = ts__irBuildConstInt(ir_module, size_type, field->array.size);
+                IRType *elem_type = convertTypeToIR(module, ir_module, field->array.sub);
+                field_types[i] = ts__irNewLaidOutArrayType(
+                    ir_module, elem_type, size, field->size / (uint32_t)field->array.size);
+            }
+            else
+            {
+                field_types[i] = convertTypeToIR(module, ir_module, field);
+            }
         }
         IRType *struct_type = ts__irNewStructType(
             ir_module,
@@ -2514,6 +2527,17 @@ static void astRecursivelyAddInputs(
             }
 
             ts__irDecorateInst(ir_mod, value, &dec);
+
+            // Vulkan requires integer fragment inputs to be flat-interpolated
+            AstType *scalar = ts__getScalarType(decl->type);
+            if (ast_mod->stage == TS_SHADER_STAGE_FRAGMENT &&
+                dec.kind == SpvDecorationLocation && scalar &&
+                (scalar->kind == TYPE_INT || scalar->kind == TYPE_BOOL))
+            {
+                IRDecoration flat = {0};
+                flat.kind = SpvDecorationFlat;
+                ts__irDecorateInst(ir_mod, value, &flat);
+            }
 
             arrPush(compiler, values, value);
         }

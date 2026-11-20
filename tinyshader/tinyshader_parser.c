@@ -1831,6 +1831,111 @@ static AstDecl *parseTopLevel(Parser *p)
     return NULL;
 }
 
+// Is this type expression plain data (as opposed to a resource handle)?
+static bool isPlainDataTypeExpr(AstExpr *type_expr)
+{
+    if (!type_expr) return false;
+    switch (type_expr->kind)
+    {
+    case EXPR_SAMPLER_TYPE:
+    case EXPR_TEXTURE_TYPE:
+    case EXPR_CONSTANT_BUFFER_TYPE:
+    case EXPR_STRUCTURED_BUFFER_TYPE:
+    case EXPR_RW_STRUCTURED_BUFFER_TYPE:
+    case EXPR_RUNTIME_ARRAY_TYPE: return false;
+    case EXPR_ARRAY_TYPE: return isPlainDataTypeExpr(type_expr->array_type.sub);
+    default: return true;
+    }
+}
+
+// HLSL puts loose (non-static, non-resource) globals into an implicit
+// constant buffer named $Globals, as DXC does. Vulkan forbids bare
+// Uniform variables of non-struct type, so do the same here.
+static void wrapLooseGlobals(Parser *p)
+{
+    TsCompiler *compiler = p->compiler;
+    ArrayOfAstDeclPtr *decls = &p->decls;
+
+    size_t last_index = 0;
+    size_t count = 0;
+    for (size_t i = 0; i < decls->len; ++i)
+    {
+        AstDecl *d = decls->ptr[i];
+        if (d->kind == DECL_VAR && d->name &&
+            d->var.storage_class == VAR_STORAGE_CLASS_UNIFORM &&
+            d->attributes.len == 0 && !d->var.value_expr &&
+            isPlainDataTypeExpr(d->var.type_expr))
+        {
+            last_index = i;
+            count++;
+        }
+    }
+    if (count == 0) return;
+
+    char *struct_name = "$Globals#cbuffer_struct";
+
+    AstDecl *struct_decl = NEW(compiler, AstDecl);
+    struct_decl->kind = DECL_STRUCT;
+    struct_decl->name = struct_name;
+
+    AstExpr *struct_name_expr = NEW(compiler, AstExpr);
+    struct_name_expr->kind = EXPR_IDENT;
+    struct_name_expr->ident.name = struct_name;
+
+    AstExpr *type_expr = NEW(compiler, AstExpr);
+    type_expr->kind = EXPR_CONSTANT_BUFFER_TYPE;
+    type_expr->buffer.sub_expr = struct_name_expr;
+
+    AstDecl *var_decl = NEW(compiler, AstDecl);
+    var_decl->kind = DECL_VAR;
+    var_decl->name = NULL;
+    var_decl->var.storage_class = VAR_STORAGE_CLASS_UNIFORM;
+    var_decl->var.type_expr = type_expr;
+
+    ArrayOfAstDeclPtr result = {0};
+    for (size_t i = 0; i < decls->len; ++i)
+    {
+        AstDecl *d = decls->ptr[i];
+        bool loose = d->kind == DECL_VAR && d->name &&
+                     d->var.storage_class == VAR_STORAGE_CLASS_UNIFORM &&
+                     d->attributes.len == 0 && !d->var.value_expr &&
+                     isPlainDataTypeExpr(d->var.type_expr);
+
+        if (loose)
+        {
+            if (!struct_decl->loc.buffer) struct_decl->loc = d->loc;
+            type_expr->loc = d->loc;
+            var_decl->loc = d->loc;
+
+            d->kind = DECL_STRUCT_FIELD;
+            d->var.storage_class = VAR_STORAGE_CLASS_NONE;
+            arrPush(compiler, &struct_decl->struct_.fields, d);
+        }
+        else
+        {
+            arrPush(compiler, &result, d);
+        }
+
+        if (i == last_index)
+        {
+            arrPush(compiler, &result, struct_decl);
+            arrPush(compiler, &result, var_decl);
+            for (size_t f = 0; f < struct_decl->struct_.fields.len; ++f)
+            {
+                AstDecl *field = struct_decl->struct_.fields.ptr[f];
+                AstDecl *alias_decl = NEW(compiler, AstDecl);
+                alias_decl->kind = DECL_ALIAS;
+                alias_decl->loc = field->loc;
+                alias_decl->name = field->name;
+                alias_decl->alias.accessed = var_decl;
+                arrPush(compiler, &result, alias_decl);
+            }
+        }
+    }
+
+    *decls = result;
+}
+
 ArrayOfAstDeclPtr ts__parse(TsCompiler *compiler, ArrayOfToken tokens)
 {
     Parser *p = NEW(compiler, Parser);
@@ -1860,6 +1965,8 @@ ArrayOfAstDeclPtr ts__parse(TsCompiler *compiler, ArrayOfToken tokens)
             break;
         }
     }
+
+    if (compiler->errors.len == 0) wrapLooseGlobals(p);
 
     return p->decls;
 }

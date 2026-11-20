@@ -451,6 +451,7 @@ typedef struct IRType
         {
             struct IRInst *size;
             struct IRType *sub;
+            uint32_t stride; // 0 = no explicit layout
         } array;
     };
 } IRType;
@@ -1466,6 +1467,7 @@ IRType *ts__irNewFloatType(IRModule *m, uint32_t bits);
 IRType *ts__irNewIntType(IRModule *m, uint32_t bits, bool is_signed);
 IRType *ts__irNewRuntimeArrayType(IRModule *m, IRType *sub);
 IRType *ts__irNewArrayType(IRModule *m, IRType *sub, IRInst *size);
+IRType *ts__irNewLaidOutArrayType(IRModule *m, IRType *sub, IRInst *size, uint32_t stride);
 IRType *ts__irNewFuncType(
     IRModule *m, IRType *return_type, IRType **params, uint32_t param_count);
 IRType *ts__irNewStructType(
