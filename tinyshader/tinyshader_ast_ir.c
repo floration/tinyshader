@@ -2118,6 +2118,7 @@ static void astBuildExpr(Module *ast_mod, IRModule *ir_mod, AstExpr *expr)
     }
 
     case EXPR_RUNTIME_ARRAY_TYPE:
+    case EXPR_TEMPLATE_INST:
     case EXPR_ARRAY_TYPE:
     case EXPR_CONSTANT_BUFFER_TYPE:
     case EXPR_STRUCTURED_BUFFER_TYPE:
@@ -2980,7 +2981,7 @@ void ts__astModuleBuild(Module *ast_mod, IRModule *ir_mod)
         switch (decl->kind)
         {
         case DECL_FUNC: {
-            if (decl->func.template_param_count) break; // only instances are built
+            if (decl->template_param_count) break; // only instances are built
             TS_ASSERT(decl->type);
 
             if (!decl->func.called) break;

@@ -49,6 +49,7 @@ static TsCompiler *ts__CompilerCreate(void)
     ts__sbInit(&compiler->sb);
 
     ts__hashInit(compiler, &compiler->keyword_table, 32);
+    ts__hashInit(compiler, &compiler->template_names, 0);
     ts__hashInit(compiler, &compiler->builtin_function_table, 32);
 
     ts__hashSet(&compiler->keyword_table, "const", (void *)TOKEN_CONST);

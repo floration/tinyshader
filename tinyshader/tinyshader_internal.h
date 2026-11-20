@@ -1102,6 +1102,7 @@ typedef enum AstExprKind {
     EXPR_ARRAY_TYPE,
     EXPR_RUNTIME_ARRAY_TYPE,
     EXPR_COMPOSITE_LITERAL,
+    EXPR_TEMPLATE_INST, // Name<args...>
 } AstExprKind;
 
 typedef struct AstSwitchLabel
@@ -1179,6 +1180,16 @@ typedef enum AstInterpolation {
 struct AstDecl
 {
     uint32_t interpolation; // AstInterpolation flags
+
+    // Templates (functions and structs): the source tokens are re-parsed for
+    // each set of template arguments, so every instance is an independent AST.
+    char **template_params;
+    uint32_t template_param_count;
+    Token *template_tokens;
+    size_t template_token_count;
+    struct AstDecl *instance_of;    // for instances: the template
+    struct AstType **instance_args; // ...and its arguments
+
     AstDeclKind kind;
     Location loc;
     char *name;
@@ -1202,13 +1213,6 @@ struct AstDecl
             ArrayOfAstDeclPtr var_decls;
 
             bool called; // if this function was called or if it's an entry point
-
-            // Function templates: the source tokens are re-parsed for each
-            // set of deduced types, so instances are independent ASTs.
-            char **template_params;
-            uint32_t template_param_count;
-            Token *template_tokens;
-            size_t template_token_count;
         } func;
 
         struct
@@ -1346,6 +1350,12 @@ struct AstExpr
         {
             ArrayOfAstExprPtr exprs;
         } composite_literal;
+
+        struct
+        {
+            AstExpr *base; // EXPR_IDENT naming the template
+            ArrayOfAstExprPtr args;
+        } template_inst;
     };
 };
 
@@ -1370,6 +1380,7 @@ typedef struct TsCompiler
     StringBuilder sb;
 
     HashMap keyword_table;
+    HashMap template_names; // names declared with template<...>, so 'Name<' parses as arguments
     HashMap builtin_function_table;
     HashMap files; // Maps absolute paths to files
 

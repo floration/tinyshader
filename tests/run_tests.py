@@ -86,7 +86,11 @@ def test_dir(dir, expect_ok):
                 else:
                     sizes.append((filename, os.path.getsize(out), os.path.getsize(opt_out)))
 
-        if use_dxc:
+        # Tests of deliberate extensions beyond DXC say so in their source
+        with open(src, encoding="utf-8", errors="replace") as fh:
+            tinyshader_only = "tinyshader-only" in fh.read()
+
+        if use_dxc and not tinyshader_only:
             dxc_out = os.path.join(outdir, base + ".dxc.spv")
             ok_dxc, log = run(["dxc", src, "-E", "main", "-T", dxc_profile, "-spirv",
                                "-fspv-target-env=" + TARGET_ENV, "-Fo", dxc_out])

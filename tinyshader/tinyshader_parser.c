@@ -13,6 +13,9 @@ typedef struct Parser
     ArrayOfAstDeclPtr decls;
 
     size_t pos;
+
+    // A '>>' that closed a nested template argument list still owes one '>'
+    bool pending_greater;
 } Parser;
 
 static AstExpr *parseExpr(Parser *p);
@@ -73,6 +76,8 @@ static inline void parserEndLoc(Parser *p, Location *loc)
     loc->length = (parserPeek(p, 0)->loc.pos + parserPeek(p, 0)->loc.length) - loc->pos;
 }
 
+static AstExpr *parsePrimaryExpr(Parser *p);
+
 static AstExpr *parseIdentExpr(Parser *p)
 {
     TsCompiler *compiler = p->compiler;
@@ -88,6 +93,51 @@ static AstExpr *parseIdentExpr(Parser *p)
 
         parserEndLoc(p, &loc);
         expr->loc = loc;
+
+        // Template arguments, only for names declared as templates so that
+        // "a < b" stays a comparison
+        void *dummy = NULL;
+        if (!parserIsAtEnd(p) && parserPeek(p, 0)->kind == TOKEN_LESS &&
+            ts__hashGet(&compiler->template_names, expr->ident.name, &dummy))
+        {
+            parserNext(p, 1);
+
+            AstExpr *inst = NEW(compiler, AstExpr);
+            inst->kind = EXPR_TEMPLATE_INST;
+            inst->template_inst.base = expr;
+
+            for (;;)
+            {
+                if (parserIsAtEnd(p)) break;
+                AstExpr *arg = parsePrimaryExpr(p);
+                if (!arg) return NULL;
+                arrPush(compiler, &inst->template_inst.args, arg);
+
+                if (p->pending_greater)
+                {
+                    p->pending_greater = false;
+                    break;
+                }
+                if (parserPeek(p, 0)->kind == TOKEN_COMMA)
+                {
+                    parserNext(p, 1);
+                    continue;
+                }
+                if (parserPeek(p, 0)->kind == TOKEN_RSHIFT)
+                {
+                    // "A<B<float>>": this '>>' closes both lists
+                    parserNext(p, 1);
+                    p->pending_greater = true;
+                    break;
+                }
+                if (!parserConsume(p, TOKEN_GREATER)) return NULL;
+                break;
+            }
+
+            parserEndLoc(p, &loc);
+            inst->loc = loc;
+            return inst;
+        }
 
         return expr;
     }
@@ -1621,20 +1671,35 @@ static AstDecl *parseTemplate(Parser *p)
     if (!parserConsume(p, TOKEN_GREATER)) return NULL;
 
     size_t start = p->pos;
+
+    // Register the name before parsing the body so it can name itself
+    // (e.g. a struct template member function signature)
+    if (parserLengthLeft(p) >= 2)
+    {
+        size_t probe = p->pos;
+        if (p->tokens[probe].kind == TOKEN_STRUCT && probe + 1 < p->token_count &&
+            p->tokens[probe + 1].kind == TOKEN_IDENT)
+        {
+            ts__hashSet(&compiler->template_names, p->tokens[probe + 1].str, (void *)1);
+        }
+    }
+
     AstDecl *decl = parseTopLevel(p);
     if (!decl) return NULL;
 
-    if (decl->kind != DECL_FUNC || names.len == 0)
+    if ((decl->kind != DECL_FUNC && decl->kind != DECL_STRUCT) || names.len == 0)
     {
         parserEndLoc(p, &loc);
-        ts__addErr(compiler, &loc, "only function templates are supported");
+        ts__addErr(compiler, &loc, "only function and struct templates are supported");
         return NULL;
     }
 
-    decl->func.template_params = names.ptr;
-    decl->func.template_param_count = (uint32_t)names.len;
-    decl->func.template_tokens = &p->tokens[start];
-    decl->func.template_token_count = p->pos - start;
+    ts__hashSet(&compiler->template_names, decl->name, (void *)1);
+
+    decl->template_params = names.ptr;
+    decl->template_param_count = (uint32_t)names.len;
+    decl->template_tokens = &p->tokens[start];
+    decl->template_token_count = p->pos - start;
     return decl;
 }
 
@@ -1644,8 +1709,8 @@ AstDecl *ts__parseTemplateInstance(TsCompiler *compiler, AstDecl *template_decl)
     Parser *sub = NEW(compiler, Parser);
     memset(sub, 0, sizeof(*sub));
     sub->compiler = compiler;
-    sub->tokens = template_decl->func.template_tokens;
-    sub->token_count = template_decl->func.template_token_count;
+    sub->tokens = template_decl->template_tokens;
+    sub->token_count = template_decl->template_token_count;
     return parseTopLevel(sub);
 }
 
@@ -2136,6 +2201,9 @@ ArrayOfAstDeclPtr ts__parse(TsCompiler *compiler, ArrayOfToken tokens)
     p->compiler = compiler;
     p->tokens = tokens.ptr;
     p->token_count = tokens.len;
+
+    // Template names are per compilation
+    ts__hashInit(compiler, &compiler->template_names, 0);
 
     while (!parserIsAtEnd(p))
     {

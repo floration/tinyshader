@@ -1244,53 +1244,20 @@ static void analyzerPopScope(Analyzer *a, Scope *scope);
 static int templateParamIndex(AstDecl *tmpl, AstExpr *type_expr)
 {
     if (!type_expr || type_expr->kind != EXPR_IDENT) return -1;
-    for (uint32_t i = 0; i < tmpl->func.template_param_count; ++i)
+    for (uint32_t i = 0; i < tmpl->template_param_count; ++i)
     {
-        if (strcmp(tmpl->func.template_params[i], type_expr->ident.name) == 0) return (int)i;
+        if (strcmp(tmpl->template_params[i], type_expr->ident.name) == 0) return (int)i;
     }
     return -1;
 }
 
-// Calling a function template: deduce its parameters from the argument types,
-// instantiate (or reuse) "name<types>", and point the call at the instance.
-static void analyzerInstantiateTemplateCall(Analyzer *a, AstExpr *expr, AstDecl *tmpl)
+// Returns the instance of 'tmpl' for these template arguments ("name<types>"),
+// creating and analyzing it on first use.
+static AstDecl *analyzerInstantiate(Analyzer *a, AstDecl *tmpl, AstType **bound, Location *loc)
 {
     TsCompiler *compiler = a->compiler;
     Module *m = a->module;
-
-    uint32_t arg_count = (uint32_t)arrLength(expr->func_call.params);
-    if (arg_count != arrLength(tmpl->func.params))
-    {
-        ts__addErr(compiler, &expr->loc, "wrong amount of parameters for function call");
-        return;
-    }
-
-    uint32_t n = tmpl->func.template_param_count;
-    AstType **bound = NEW_ARRAY(compiler, AstType *, n);
-
-    for (uint32_t i = 0; i < arg_count; ++i)
-    {
-        AstExpr *arg = expr->func_call.params.ptr[i];
-        analyzerAnalyzeExpr(a, arg, NULL);
-        if (!arg->type) return;
-
-        int idx = templateParamIndex(tmpl, tmpl->func.params.ptr[i]->var.type_expr);
-        if (idx < 0) continue;
-
-        if (!bound[idx])
-        {
-            bound[idx] = arg->type;
-        }
-        else if (bound[idx] != arg->type)
-        {
-            ts__addErr(compiler, &arg->loc,
-                       "conflicting types deduced for template parameter '%s': '%s' and '%s'",
-                       tmpl->func.template_params[idx],
-                       ts__typeToPrettyString(compiler, bound[idx]),
-                       ts__typeToPrettyString(compiler, arg->type));
-            return;
-        }
-    }
+    uint32_t n = tmpl->template_param_count;
 
     // Type names first: ts__typeToPrettyString uses the shared string builder
     char **type_names = NEW_ARRAY(compiler, char *, n);
@@ -1298,10 +1265,10 @@ static void analyzerInstantiateTemplateCall(Analyzer *a, AstExpr *expr, AstDecl 
     {
         if (!bound[i])
         {
-            ts__addErr(compiler, &expr->loc,
+            ts__addErr(compiler, loc,
                        "could not deduce template parameter '%s' from the arguments",
-                       tmpl->func.template_params[i]);
-            return;
+                       tmpl->template_params[i]);
+            return NULL;
         }
         type_names[i] = ts__typeToPrettyString(compiler, bound[i]);
     }
@@ -1317,53 +1284,174 @@ static void analyzerInstantiateTemplateCall(Analyzer *a, AstExpr *expr, AstDecl 
     ts__sbAppend(&compiler->sb, ">");
     char *mangled = ts__sbBuild(&compiler->sb, &compiler->alloc);
 
-    if (!scopeGetLocal(m->scope, mangled))
+    AstDecl *existing = scopeGetLocal(m->scope, mangled);
+    if (existing) return existing;
+
+    AstDecl *instance = ts__parseTemplateInstance(compiler, tmpl);
+    if (!instance) return NULL;
+    instance->name = mangled;
+    instance->instance_of = tmpl;
+    instance->instance_args = NEW_ARRAY(compiler, AstType *, n);
+    memcpy(instance->instance_args, bound, n * sizeof(AstType *));
+    scopeAdd(m->scope, mangled, instance);
+
+    // Template parameters are visible only inside the instance
+    Scope *tmpl_scope = NEW(compiler, Scope);
+    scopeInit(compiler, tmpl_scope, m->scope, NULL);
+    for (uint32_t i = 0; i < n; ++i)
     {
-        AstDecl *instance = ts__parseTemplateInstance(compiler, tmpl);
-        if (!instance) return;
-        instance->name = mangled;
-        scopeAdd(m->scope, mangled, instance);
+        AstDecl *alias = NEW(compiler, AstDecl);
+        alias->kind = DECL_TYPE_ALIAS;
+        alias->loc = tmpl->loc;
+        alias->name = tmpl->template_params[i];
+        alias->type = newBasicType(m, TYPE_TYPE);
+        alias->as_type = bound[i];
+        scopeAdd(tmpl_scope, alias->name, alias);
+    }
 
-        // Template parameters are visible only inside the instance
-        Scope *tmpl_scope = NEW(compiler, Scope);
-        scopeInit(compiler, tmpl_scope, m->scope, NULL);
-        for (uint32_t i = 0; i < n; ++i)
-        {
-            AstDecl *alias = NEW(compiler, AstDecl);
-            alias->kind = DECL_TYPE_ALIAS;
-            alias->loc = tmpl->loc;
-            alias->name = tmpl->func.template_params[i];
-            alias->type = newBasicType(m, TYPE_TYPE);
-            alias->as_type = bound[i];
-            scopeAdd(tmpl_scope, alias->name, alias);
-        }
+    // Analyze it as if at top level, then restore the caller's state
+    ArrayOfScopePtr saved_scopes = a->scope_stack;
+    ArrayOfAstStmtPtr saved_break = a->break_stack;
+    ArrayOfAstStmtPtr saved_continue = a->continue_stack;
+    AstDecl *saved_func = a->scope_func;
+    memset(&a->scope_stack, 0, sizeof(a->scope_stack));
+    memset(&a->break_stack, 0, sizeof(a->break_stack));
+    memset(&a->continue_stack, 0, sizeof(a->continue_stack));
+    a->scope_func = NULL;
 
-        // Analyze it as if at top level, then restore the caller's state
-        ArrayOfScopePtr saved_scopes = a->scope_stack;
-        ArrayOfAstStmtPtr saved_break = a->break_stack;
-        ArrayOfAstStmtPtr saved_continue = a->continue_stack;
-        AstDecl *saved_func = a->scope_func;
-        memset(&a->scope_stack, 0, sizeof(a->scope_stack));
-        memset(&a->break_stack, 0, sizeof(a->break_stack));
-        memset(&a->continue_stack, 0, sizeof(a->continue_stack));
-        a->scope_func = NULL;
+    analyzerPushScope(a, m->scope);
+    analyzerPushScope(a, tmpl_scope);
+    analyzerAnalyzeDecl(a, instance);
+    analyzerPopScope(a, tmpl_scope);
+    analyzerPopScope(a, m->scope);
 
-        analyzerPushScope(a, m->scope);
-        analyzerPushScope(a, tmpl_scope);
-        analyzerAnalyzeDecl(a, instance);
-        analyzerPopScope(a, tmpl_scope);
-        analyzerPopScope(a, m->scope);
+    a->scope_stack = saved_scopes;
+    a->break_stack = saved_break;
+    a->continue_stack = saved_continue;
+    a->scope_func = saved_func;
 
-        a->scope_stack = saved_scopes;
-        a->break_stack = saved_break;
-        a->continue_stack = saved_continue;
-        a->scope_func = saved_func;
-
+    if (instance->kind == DECL_FUNC)
+    {
         // After its own analysis, so instances it uses come first
         arrPush(compiler, &a->template_instances, instance);
     }
+    return instance;
+}
 
-    expr->func_call.func_expr->ident.name = mangled;
+// Explicit template arguments ("f<float>" or "Pair<float, int>") as types
+static bool analyzerTemplateArgs(
+    Analyzer *a, AstDecl *tmpl, ArrayOfAstExprPtr args, AstType **bound, Location *loc)
+{
+    TsCompiler *compiler = a->compiler;
+    if (args.len > tmpl->template_param_count)
+    {
+        ts__addErr(compiler, loc, "too many template arguments for '%s'", tmpl->name);
+        return false;
+    }
+    for (size_t i = 0; i < args.len; ++i)
+    {
+        analyzerAnalyzeExpr(a, args.ptr[i], NULL);
+        if (!args.ptr[i]->type || args.ptr[i]->type->kind != TYPE_TYPE || !args.ptr[i]->as_type)
+        {
+            ts__addErr(compiler, &args.ptr[i]->loc, "template argument must be a type");
+            return false;
+        }
+        bound[i] = args.ptr[i]->as_type;
+    }
+    return true;
+}
+
+// Matches a parameter's type expression against an argument's type, binding
+// template parameters: "T" binds directly, "Pair<T>" matches an instance of
+// Pair and recurses into its arguments. Returns false on a conflict.
+static bool unifyTemplateType(
+    Analyzer *a, AstDecl *tmpl, AstExpr *pattern, AstType *type, AstType **bound, int *conflict)
+{
+    int idx = templateParamIndex(tmpl, pattern);
+    if (idx >= 0)
+    {
+        if (!bound[idx]) bound[idx] = type;
+        else if (bound[idx] != type)
+        {
+            *conflict = idx;
+            return false;
+        }
+        return true;
+    }
+
+    if (pattern && pattern->kind == EXPR_TEMPLATE_INST && type->kind == TYPE_STRUCT)
+    {
+        AstDecl *inst = scopeGetLocal(a->module->scope, type->struct_.name);
+        if (!inst || !inst->instance_of ||
+            strcmp(inst->instance_of->name, pattern->template_inst.base->ident.name) != 0)
+        {
+            return true; // not an instance of that template; nothing to deduce
+        }
+        ArrayOfAstExprPtr args = pattern->template_inst.args;
+        for (size_t i = 0; i < args.len && i < inst->instance_of->template_param_count; ++i)
+        {
+            if (!unifyTemplateType(a, tmpl, args.ptr[i], inst->instance_args[i], bound, conflict))
+                return false;
+        }
+    }
+    return true;
+}
+
+// Calling a function template: take any explicit arguments, deduce the rest
+// from the argument types, and point the call at the instance.
+static void analyzerInstantiateTemplateCall(
+    Analyzer *a, AstExpr *expr, AstDecl *tmpl, ArrayOfAstExprPtr *explicit_args)
+{
+    TsCompiler *compiler = a->compiler;
+
+    uint32_t arg_count = (uint32_t)arrLength(expr->func_call.params);
+    if (arg_count != arrLength(tmpl->func.params))
+    {
+        ts__addErr(compiler, &expr->loc, "wrong amount of parameters for function call");
+        return;
+    }
+
+    uint32_t n = tmpl->template_param_count;
+    AstType **bound = NEW_ARRAY(compiler, AstType *, n);
+    bool *is_explicit = NEW_ARRAY(compiler, bool, n);
+
+    if (explicit_args)
+    {
+        if (!analyzerTemplateArgs(a, tmpl, *explicit_args, bound, &expr->loc)) return;
+        for (size_t i = 0; i < explicit_args->len; ++i) is_explicit[i] = true;
+    }
+
+    for (uint32_t i = 0; i < arg_count; ++i)
+    {
+        AstExpr *arg = expr->func_call.params.ptr[i];
+        int idx = templateParamIndex(tmpl, tmpl->func.params.ptr[i]->var.type_expr);
+
+        // Arguments to explicitly typed parameters convert like normal calls
+        if (idx >= 0 && is_explicit[idx]) continue;
+
+        analyzerAnalyzeExpr(a, arg, NULL);
+        if (!arg->type) return;
+
+        AstType *before = (idx >= 0) ? bound[idx] : NULL;
+        int conflict = -1;
+        if (!unifyTemplateType(
+                a, tmpl, tmpl->func.params.ptr[i]->var.type_expr, arg->type, bound, &conflict))
+        {
+            ts__addErr(compiler, &arg->loc,
+                       "conflicting types deduced for template parameter '%s': '%s' and '%s'",
+                       tmpl->template_params[conflict],
+                       ts__typeToPrettyString(compiler, idx == conflict && before ? before : bound[conflict]),
+                       ts__typeToPrettyString(compiler, arg->type));
+            return;
+        }
+    }
+
+    AstDecl *instance = analyzerInstantiate(a, tmpl, bound, &expr->loc);
+    if (!instance) return;
+
+    AstExpr *func_expr = expr->func_call.func_expr;
+    func_expr->kind = EXPR_IDENT;
+    func_expr->ident.name = instance->name;
 }
 
 // Wraps an already-analyzed expression in an implicit conversion to 'type'.
@@ -1821,6 +1909,15 @@ static void analyzerAnalyzeExpr(Analyzer *a, AstExpr *expr, AstType *expected_ty
             break;
         }
 
+        if (decl->template_param_count)
+        {
+            ts__addErr(compiler, &expr->loc,
+                       (decl->kind == DECL_FUNC) ? "function template '%s' must be called"
+                                                 : "template '%s' needs template arguments",
+                       expr->ident.name);
+            break;
+        }
+
         if (decl->kind == DECL_FUNC)
         {
             decl->func.called = true;
@@ -2067,13 +2164,18 @@ static void analyzerAnalyzeExpr(Analyzer *a, AstExpr *expr, AstType *expected_ty
 
         AstExpr *func_expr = expr->func_call.func_expr;
 
-        if (func_expr->kind == EXPR_IDENT)
+        if (func_expr->kind == EXPR_IDENT || func_expr->kind == EXPR_TEMPLATE_INST)
         {
-            AstDecl *callee = scopeGetGlobal(scope, func_expr->ident.name);
-            if (callee && callee->kind == DECL_FUNC && callee->func.template_param_count)
+            bool has_args = func_expr->kind == EXPR_TEMPLATE_INST;
+            AstExpr *name_expr = has_args ? func_expr->template_inst.base : func_expr;
+            AstDecl *callee = scopeGetGlobal(scope, name_expr->ident.name);
+            if (callee && callee->kind == DECL_FUNC && callee->template_param_count)
             {
-                analyzerInstantiateTemplateCall(a, expr, callee);
-                if (func_expr->ident.name == callee->name) break; // failed; error reported
+                ArrayOfAstExprPtr explicit_args = func_expr->template_inst.args;
+                analyzerInstantiateTemplateCall(
+                    a, expr, callee, has_args ? &explicit_args : NULL);
+                if (func_expr->kind != EXPR_IDENT) break; // failed; error reported
+                if (has_args) func_expr->ident.name = func_expr->ident.name; // now the instance
             }
         }
 
@@ -4542,6 +4644,34 @@ static void analyzerAnalyzeExpr(Analyzer *a, AstExpr *expr, AstType *expected_ty
         TS_ASSERT(expr->auto_cast.sub->type);
         break;
     }
+
+    case EXPR_TEMPLATE_INST:
+    {
+        // A struct template used as a type: Pair<float>
+        AstExpr *base = expr->template_inst.base;
+        AstDecl *tmpl = scopeGetGlobal(scope, base->ident.name);
+        if (!tmpl || !tmpl->template_param_count)
+        {
+            ts__addErr(compiler, &expr->loc, "'%s' is not a template", base->ident.name);
+            break;
+        }
+        if (tmpl->kind != DECL_STRUCT)
+        {
+            ts__addErr(compiler, &expr->loc, "function template '%s' must be called",
+                       tmpl->name);
+            break;
+        }
+
+        AstType **bound = NEW_ARRAY(compiler, AstType *, tmpl->template_param_count);
+        if (!analyzerTemplateArgs(a, tmpl, expr->template_inst.args, bound, &expr->loc)) break;
+
+        AstDecl *instance = analyzerInstantiate(a, tmpl, bound, &expr->loc);
+        if (!instance) break;
+
+        expr->type = instance->type;
+        expr->as_type = instance->as_type;
+        break;
+    }
     }
 
     if (expected_type)
@@ -4820,7 +4950,7 @@ static void analyzerAnalyzeDecl(Analyzer *a, AstDecl *decl)
     Scope *scope = analyzerCurrentScope(a);
 
     // Templates are analyzed per instance, when called
-    if (decl->kind == DECL_FUNC && decl->func.template_param_count) return;
+    if (decl->template_param_count) return;
 
     for (uint32_t i = 0; i < arrLength(decl->attributes); ++i)
     {
