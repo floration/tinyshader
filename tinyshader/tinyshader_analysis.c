@@ -16,6 +16,9 @@ typedef struct Analyzer
     ArrayOfAstStmtPtr break_stack;
 
     uint32_t last_uniform_binding;
+
+    // Function template instances, in the order they finished analysis
+    ArrayOfAstDeclPtr template_instances;
 } Analyzer;
 
 static void scopeInit(TsCompiler *compiler, Scope *scope, Scope *parent, AstDecl *owner)
@@ -1207,16 +1210,12 @@ static void analyzerAnalyzeCast(Analyzer *a, AstExpr *expr, AstType *target)
         // splat (1 -> n), same size, or truncation (n -> fewer)
         ok = (src_n == 1) || (src_n >= dst_n);
     }
-    else if (target->kind == TYPE_STRUCT || target->kind == TYPE_ARRAY || target->kind == TYPE_MATRIX)
+    else if ((target->kind == TYPE_STRUCT || target->kind == TYPE_ARRAY ||
+              target->kind == TYPE_MATRIX) &&
+             src->kind != TYPE_VECTOR && isNumericOrBool(src))
     {
-        // Only "(T)0" is supported: zero-initialization
-        ok = operand->resolved_int && *operand->resolved_int == 0;
-        if (!ok)
-        {
-            ts__addErr(compiler, &expr->loc,
-                       "only '(T)0' zero-initialization casts are supported for this type");
-            return;
-        }
+        // "(T)scalar" fills every member with the scalar ("(T)0" zero-initializes)
+        ok = true;
     }
     else if (src == target)
     {
@@ -1235,6 +1234,136 @@ static void analyzerAnalyzeCast(Analyzer *a, AstExpr *expr, AstType *target)
     expr->loc = loc;
     expr->auto_cast.sub = operand;
     expr->type = target;
+}
+
+static void analyzerAnalyzeDecl(Analyzer *a, AstDecl *decl);
+static void analyzerPushScope(Analyzer *a, Scope *scope);
+static void analyzerPopScope(Analyzer *a, Scope *scope);
+
+// Is this type expression just the name of a template parameter? Returns its index.
+static int templateParamIndex(AstDecl *tmpl, AstExpr *type_expr)
+{
+    if (!type_expr || type_expr->kind != EXPR_IDENT) return -1;
+    for (uint32_t i = 0; i < tmpl->func.template_param_count; ++i)
+    {
+        if (strcmp(tmpl->func.template_params[i], type_expr->ident.name) == 0) return (int)i;
+    }
+    return -1;
+}
+
+// Calling a function template: deduce its parameters from the argument types,
+// instantiate (or reuse) "name<types>", and point the call at the instance.
+static void analyzerInstantiateTemplateCall(Analyzer *a, AstExpr *expr, AstDecl *tmpl)
+{
+    TsCompiler *compiler = a->compiler;
+    Module *m = a->module;
+
+    uint32_t arg_count = (uint32_t)arrLength(expr->func_call.params);
+    if (arg_count != arrLength(tmpl->func.params))
+    {
+        ts__addErr(compiler, &expr->loc, "wrong amount of parameters for function call");
+        return;
+    }
+
+    uint32_t n = tmpl->func.template_param_count;
+    AstType **bound = NEW_ARRAY(compiler, AstType *, n);
+
+    for (uint32_t i = 0; i < arg_count; ++i)
+    {
+        AstExpr *arg = expr->func_call.params.ptr[i];
+        analyzerAnalyzeExpr(a, arg, NULL);
+        if (!arg->type) return;
+
+        int idx = templateParamIndex(tmpl, tmpl->func.params.ptr[i]->var.type_expr);
+        if (idx < 0) continue;
+
+        if (!bound[idx])
+        {
+            bound[idx] = arg->type;
+        }
+        else if (bound[idx] != arg->type)
+        {
+            ts__addErr(compiler, &arg->loc,
+                       "conflicting types deduced for template parameter '%s': '%s' and '%s'",
+                       tmpl->func.template_params[idx],
+                       ts__typeToPrettyString(compiler, bound[idx]),
+                       ts__typeToPrettyString(compiler, arg->type));
+            return;
+        }
+    }
+
+    // Type names first: ts__typeToPrettyString uses the shared string builder
+    char **type_names = NEW_ARRAY(compiler, char *, n);
+    for (uint32_t i = 0; i < n; ++i)
+    {
+        if (!bound[i])
+        {
+            ts__addErr(compiler, &expr->loc,
+                       "could not deduce template parameter '%s' from the arguments",
+                       tmpl->func.template_params[i]);
+            return;
+        }
+        type_names[i] = ts__typeToPrettyString(compiler, bound[i]);
+    }
+
+    ts__sbReset(&compiler->sb);
+    ts__sbAppend(&compiler->sb, tmpl->name);
+    ts__sbAppend(&compiler->sb, "<");
+    for (uint32_t i = 0; i < n; ++i)
+    {
+        if (i > 0) ts__sbAppend(&compiler->sb, ",");
+        ts__sbAppend(&compiler->sb, type_names[i]);
+    }
+    ts__sbAppend(&compiler->sb, ">");
+    char *mangled = ts__sbBuild(&compiler->sb, &compiler->alloc);
+
+    if (!scopeGetLocal(m->scope, mangled))
+    {
+        AstDecl *instance = ts__parseTemplateInstance(compiler, tmpl);
+        if (!instance) return;
+        instance->name = mangled;
+        scopeAdd(m->scope, mangled, instance);
+
+        // Template parameters are visible only inside the instance
+        Scope *tmpl_scope = NEW(compiler, Scope);
+        scopeInit(compiler, tmpl_scope, m->scope, NULL);
+        for (uint32_t i = 0; i < n; ++i)
+        {
+            AstDecl *alias = NEW(compiler, AstDecl);
+            alias->kind = DECL_TYPE_ALIAS;
+            alias->loc = tmpl->loc;
+            alias->name = tmpl->func.template_params[i];
+            alias->type = newBasicType(m, TYPE_TYPE);
+            alias->as_type = bound[i];
+            scopeAdd(tmpl_scope, alias->name, alias);
+        }
+
+        // Analyze it as if at top level, then restore the caller's state
+        ArrayOfScopePtr saved_scopes = a->scope_stack;
+        ArrayOfAstStmtPtr saved_break = a->break_stack;
+        ArrayOfAstStmtPtr saved_continue = a->continue_stack;
+        AstDecl *saved_func = a->scope_func;
+        memset(&a->scope_stack, 0, sizeof(a->scope_stack));
+        memset(&a->break_stack, 0, sizeof(a->break_stack));
+        memset(&a->continue_stack, 0, sizeof(a->continue_stack));
+        a->scope_func = NULL;
+
+        analyzerPushScope(a, m->scope);
+        analyzerPushScope(a, tmpl_scope);
+        analyzerAnalyzeDecl(a, instance);
+        analyzerPopScope(a, tmpl_scope);
+        analyzerPopScope(a, m->scope);
+
+        a->scope_stack = saved_scopes;
+        a->break_stack = saved_break;
+        a->continue_stack = saved_continue;
+        a->scope_func = saved_func;
+
+        // After its own analysis, so instances it uses come first
+        arrPush(compiler, &a->template_instances, instance);
+    }
+
+    expr->func_call.func_expr->ident.name = mangled;
 }
 
 // Wraps an already-analyzed expression in an implicit conversion to 'type'.
@@ -1461,6 +1590,8 @@ static void analyzerRecursivelyCheckForSemanticStrings(
         }
         break;
     }
+
+    case DECL_TYPE_ALIAS:
 
     case DECL_STRUCT_FIELD:
     {
@@ -1935,6 +2066,16 @@ static void analyzerAnalyzeExpr(Analyzer *a, AstExpr *expr, AstType *expected_ty
         }
 
         AstExpr *func_expr = expr->func_call.func_expr;
+
+        if (func_expr->kind == EXPR_IDENT)
+        {
+            AstDecl *callee = scopeGetGlobal(scope, func_expr->ident.name);
+            if (callee && callee->kind == DECL_FUNC && callee->func.template_param_count)
+            {
+                analyzerInstantiateTemplateCall(a, expr, callee);
+                if (func_expr->ident.name == callee->name) break; // failed; error reported
+            }
+        }
 
         bool is_builtin_func = false;
         AstBuiltinFunction builtin_func_kind;
@@ -4656,6 +4797,9 @@ static void analyzerAnalyzeDecl(Analyzer *a, AstDecl *decl)
     Module *m = a->module;
     Scope *scope = analyzerCurrentScope(a);
 
+    // Templates are analyzed per instance, when called
+    if (decl->kind == DECL_FUNC && decl->func.template_param_count) return;
+
     for (uint32_t i = 0; i < arrLength(decl->attributes); ++i)
     {
         AstAttribute *attr = &decl->attributes.ptr[i];
@@ -4950,6 +5094,8 @@ static void analyzerAnalyzeDecl(Analyzer *a, AstDecl *decl)
         break;
     }
 
+    case DECL_TYPE_ALIAS:
+
     case DECL_STRUCT_FIELD: {
         analyzerAnalyzeExpr(a, decl->var.type_expr, newBasicType(m, TYPE_TYPE));
         if (!decl->var.type_expr->as_type)
@@ -5088,11 +5234,21 @@ void ts__analyze(
         analyzerTryRegisterDecl(a, decl);
     }
 
+    // Template instances are emitted ahead of the declaration that needed them
+    ArrayOfAstDeclPtr all_decls = {0};
     for (uint32_t i = 0; i < decl_count; ++i)
     {
         AstDecl *decl = decls[i];
+        size_t before = a->template_instances.len;
         analyzerAnalyzeDecl(a, decl);
+        for (size_t k = before; k < a->template_instances.len; ++k)
+        {
+            arrPush(compiler, &all_decls, a->template_instances.ptr[k]);
+        }
+        arrPush(compiler, &all_decls, decl);
     }
+    a->module->decls = all_decls.ptr;
+    a->module->decl_count = all_decls.len;
 
     analyzerPopScope(a, a->module->scope);
 }

@@ -1591,10 +1591,74 @@ static bool parseAttr(Parser *p, AstAttribute *attr)
     return true;
 }
 
+static AstDecl *parseTopLevel(Parser *p);
+
+// template<typename T, class U> <function declaration>
+static AstDecl *parseTemplate(Parser *p)
+{
+    TsCompiler *compiler = p->compiler;
+    Location loc = parserBeginLoc(p);
+
+    parserNext(p, 1); // 'template'
+    if (!parserConsume(p, TOKEN_LESS)) return NULL;
+
+    ARRAY_OF(char *) names = {0};
+    while (!parserIsAtEnd(p) && parserPeek(p, 0)->kind != TOKEN_GREATER)
+    {
+        Token *kw = parserConsume(p, TOKEN_IDENT);
+        if (!kw) return NULL;
+        if (strcmp(kw->str, "typename") != 0 && strcmp(kw->str, "class") != 0)
+        {
+            ts__addErr(compiler, &kw->loc, "expected 'typename' or 'class'");
+            return NULL;
+        }
+        Token *name = parserConsume(p, TOKEN_IDENT);
+        if (!name) return NULL;
+        arrPush(compiler, &names, name->str);
+
+        if (parserPeek(p, 0)->kind == TOKEN_COMMA) parserNext(p, 1);
+    }
+    if (!parserConsume(p, TOKEN_GREATER)) return NULL;
+
+    size_t start = p->pos;
+    AstDecl *decl = parseTopLevel(p);
+    if (!decl) return NULL;
+
+    if (decl->kind != DECL_FUNC || names.len == 0)
+    {
+        parserEndLoc(p, &loc);
+        ts__addErr(compiler, &loc, "only function templates are supported");
+        return NULL;
+    }
+
+    decl->func.template_params = names.ptr;
+    decl->func.template_param_count = (uint32_t)names.len;
+    decl->func.template_tokens = &p->tokens[start];
+    decl->func.template_token_count = p->pos - start;
+    return decl;
+}
+
+// Re-parses a function template's tokens into a fresh declaration
+AstDecl *ts__parseTemplateInstance(TsCompiler *compiler, AstDecl *template_decl)
+{
+    Parser *sub = NEW(compiler, Parser);
+    memset(sub, 0, sizeof(*sub));
+    sub->compiler = compiler;
+    sub->tokens = template_decl->func.template_tokens;
+    sub->token_count = template_decl->func.template_token_count;
+    return parseTopLevel(sub);
+}
+
 static AstDecl *parseTopLevel(Parser *p)
 {
     TS_ASSERT(p);
     TsCompiler *compiler = p->compiler;
+
+    if (parserLengthLeft(p) >= 2 && parserPeek(p, 0)->kind == TOKEN_IDENT &&
+        strcmp(parserPeek(p, 0)->str, "template") == 0 && parserPeek(p, 1)->kind == TOKEN_LESS)
+    {
+        return parseTemplate(p);
+    }
 
     ArrayOfAstAttribute attributes = {0};
 

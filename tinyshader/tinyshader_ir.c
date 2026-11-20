@@ -1393,6 +1393,49 @@ IRInst *ts__irBuildZeroValue(IRModule *m, IRType *type)
     }
 }
 
+// Every scalar component of 'type' set to 'scalar' (converted as needed)
+IRInst *ts__irBuildSplatValue(IRModule *m, IRType *type, IRInst *scalar)
+{
+    switch (type->kind)
+    {
+    case IR_TYPE_FLOAT:
+    case IR_TYPE_INT:
+    case IR_TYPE_BOOL:
+        return (scalar->type == type) ? scalar : ts__irBuildCast(m, type, scalar);
+    case IR_TYPE_VECTOR:
+    case IR_TYPE_MATRIX:
+    case IR_TYPE_ARRAY:
+    case IR_TYPE_STRUCT: {
+        uint32_t count = 0;
+        if (type->kind == IR_TYPE_VECTOR) count = type->vector.size;
+        else if (type->kind == IR_TYPE_MATRIX) count = type->matrix.col_count;
+        else if (type->kind == IR_TYPE_STRUCT) count = type->struct_.field_count;
+        else
+        {
+            IRInst *size = type->array.size;
+            memcpy(&count, size->constant.value,
+                   size->constant.value_size_bytes < 4 ? size->constant.value_size_bytes : 4);
+        }
+
+        IRInst **elems = NEW_ARRAY(m->compiler, IRInst *, count);
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            IRType *elem_type = NULL;
+            switch (type->kind)
+            {
+            case IR_TYPE_VECTOR: elem_type = type->vector.elem_type; break;
+            case IR_TYPE_MATRIX: elem_type = type->matrix.col_type; break;
+            case IR_TYPE_STRUCT: elem_type = type->struct_.fields[i]; break;
+            default: elem_type = type->array.sub; break;
+            }
+            elems[i] = ts__irBuildSplatValue(m, elem_type, scalar);
+        }
+        return ts__irBuildCompositeConstruct(m, type, elems, count);
+    }
+    default: TS_ASSERT(0); return NULL;
+    }
+}
+
 static IRType *irElemType(IRType *t)
 {
     return (t->kind == IR_TYPE_VECTOR) ? t->vector.elem_type : t;

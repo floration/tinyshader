@@ -1080,6 +1080,7 @@ typedef enum AstDeclKind {
 
     DECL_STRUCT,
     DECL_STRUCT_FIELD,
+    DECL_TYPE_ALIAS, // a template parameter bound to a type; lives only in a scope
 } AstDeclKind;
 
 typedef enum AstExprKind {
@@ -1201,6 +1202,13 @@ struct AstDecl
             ArrayOfAstDeclPtr var_decls;
 
             bool called; // if this function was called or if it's an entry point
+
+            // Function templates: the source tokens are re-parsed for each
+            // set of deduced types, so instances are independent ASTs.
+            char **template_params;
+            uint32_t template_param_count;
+            Token *template_tokens;
+            size_t template_token_count;
         } func;
 
         struct
@@ -1463,6 +1471,7 @@ AstType *ts__getElemType(AstType *type);
 AstType *ts__getStructType(AstType *type);
 
 char *ts__typeToPrettyString(TsCompiler *compiler, AstType *type);
+AstDecl *ts__parseTemplateInstance(TsCompiler *compiler, AstDecl *template_decl);
 
 void ts__astModuleBuild(Module *ast_mod, IRModule *ir_mod);
 
@@ -1578,6 +1587,7 @@ void ts__irBuildCondBr(
 void ts__irBuildUnreachable(IRModule *m);
 IRInst *ts__irConvertLayout(IRModule *m, IRInst *value, IRType *dst_type);
 IRInst *ts__irBuildZeroValue(IRModule *m, IRType *type);
+IRInst *ts__irBuildSplatValue(IRModule *m, IRType *type, IRInst *scalar);
 void ts__irBuildSwitch(
     IRModule *m,
     IRInst *selector,

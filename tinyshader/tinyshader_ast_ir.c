@@ -1915,9 +1915,19 @@ static void astBuildExpr(Module *ast_mod, IRModule *ir_mod, AstExpr *expr)
 
         if (!dst_is_value)
         {
-            // "(Struct)0" and friends: zero-initialize
+            // "(Struct)x": every member gets x; "(Struct)0" zero-initializes
             IRType *ir_type = convertTypeToIR(ast_mod, ir_mod, expr->type);
-            expr->value = ts__irBuildZeroValue(ir_mod, ir_type);
+            AstExpr *sub = expr->auto_cast.sub;
+            if (sub->resolved_int && *sub->resolved_int == 0)
+            {
+                expr->value = ts__irBuildZeroValue(ir_mod, ir_type);
+            }
+            else
+            {
+                astBuildExpr(ast_mod, ir_mod, sub);
+                expr->value =
+                    ts__irBuildSplatValue(ir_mod, ir_type, loadVal(ir_mod, sub->value));
+            }
         }
         else if (sub_type->kind == TYPE_VECTOR &&
                  (expr->type->kind != TYPE_VECTOR ||
@@ -2572,6 +2582,7 @@ static void astBuildDecl(Module *ast_mod, IRModule *ir_mod, AstDecl *decl)
 
     case DECL_STRUCT:
     case DECL_ALIAS: break;
+    case DECL_TYPE_ALIAS:
     case DECL_STRUCT_FIELD: break;
     }
 }
@@ -2746,6 +2757,8 @@ static void astRecursivelyAddOutputs(
         break;
     }
 
+    case DECL_TYPE_ALIAS:
+
     case DECL_STRUCT_FIELD:
     case DECL_VAR:
     {
@@ -2826,6 +2839,8 @@ static void astRecursivelyAddInputs(
         break;
     }
 
+    case DECL_TYPE_ALIAS:
+
     case DECL_STRUCT_FIELD:
     case DECL_VAR:
     {
@@ -2886,6 +2901,7 @@ void ts__astModuleBuild(Module *ast_mod, IRModule *ir_mod)
         switch (decl->kind)
         {
         case DECL_FUNC: {
+            if (decl->func.template_param_count) break; // only instances are built
             TS_ASSERT(decl->type);
 
             if (!decl->func.called) break;
