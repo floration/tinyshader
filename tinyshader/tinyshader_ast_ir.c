@@ -71,6 +71,216 @@ static IRInst *loadVal(IRModule *m, IRInst *value)
     return value;
 }
 
+//
+// Buffer layout
+//
+// Constant buffers use DXC's default "relaxed std140" rules; structured
+// buffers and push constants use "relaxed std430". Relaxed means a vector
+// may be aligned to its component size as long as it doesn't improperly
+// straddle a 16-byte boundary. Types laid out this way are distinct IR types
+// from the plain ones used for locals, inputs and outputs.
+//
+typedef enum BufferLayout {
+    LAYOUT_NONE = 0,
+    LAYOUT_STD140,
+    LAYOUT_STD430,
+} BufferLayout;
+
+static uint32_t roundUp(uint32_t x, uint32_t a)
+{
+    return a ? ((x + a - 1) / a) * a : x;
+}
+
+static uint32_t scalarSize(AstType *t)
+{
+    switch (t->kind)
+    {
+    case TYPE_FLOAT: return t->float_.bits / 8;
+    case TYPE_INT: return t->int_.bits / 8;
+    case TYPE_BOOL: return 4;
+    default: TS_ASSERT(0); return 4;
+    }
+}
+
+static uint32_t vectorBaseAlign(uint32_t elem_size, uint32_t count)
+{
+    return elem_size * (count == 2 ? 2 : (count == 1 ? 1 : 4));
+}
+
+// Tinyshader stores matrices row-major (RowMajor decoration), so each
+// "row" vector holds col_count components and there are col_type->vector.size rows.
+static uint32_t matrixRowCount(AstType *t) { return t->matrix.col_type->vector.size; }
+static uint32_t matrixRowLength(AstType *t) { return t->matrix.col_count; }
+
+static uint32_t layoutMatrixStride(AstType *t, BufferLayout L)
+{
+    uint32_t elem = scalarSize(t->matrix.col_type->vector.elem_type);
+    uint32_t row_bytes = elem * matrixRowLength(t);
+    if (L == LAYOUT_STD140) return roundUp(row_bytes, 16);
+    return roundUp(row_bytes, vectorBaseAlign(elem, matrixRowLength(t)));
+}
+
+static uint32_t layoutAlign(AstType *t, BufferLayout L);
+static uint32_t layoutSize(AstType *t, BufferLayout L);
+
+static uint32_t layoutAlign(AstType *t, BufferLayout L)
+{
+    switch (t->kind)
+    {
+    case TYPE_FLOAT:
+    case TYPE_INT:
+    case TYPE_BOOL: return scalarSize(t);
+    case TYPE_VECTOR: return vectorBaseAlign(scalarSize(t->vector.elem_type), t->vector.size);
+    case TYPE_MATRIX: {
+        if (L == LAYOUT_STD140) return 16;
+        uint32_t elem = scalarSize(t->matrix.col_type->vector.elem_type);
+        return vectorBaseAlign(elem, matrixRowLength(t));
+    }
+    case TYPE_ARRAY: {
+        uint32_t a = layoutAlign(t->array.sub, L);
+        return (L == LAYOUT_STD140) ? roundUp(a, 16) : a;
+    }
+    case TYPE_STRUCT: {
+        uint32_t a = 1;
+        for (uint32_t i = 0; i < t->struct_.field_count; ++i)
+        {
+            uint32_t fa = layoutAlign(t->struct_.fields[i], L);
+            if (fa > a) a = fa;
+        }
+        return (L == LAYOUT_STD140) ? roundUp(a, 16) : a;
+    }
+    default: return 4;
+    }
+}
+
+static uint32_t layoutArrayStride(AstType *t, BufferLayout L)
+{
+    return roundUp(layoutSize(t->array.sub, L), layoutAlign(t, L));
+}
+
+static bool improperStraddle(uint32_t size, uint32_t offset)
+{
+    if (size <= 16) return (offset / 16) != ((offset + size - 1) / 16);
+    return (offset % 16) != 0;
+}
+
+// Where does a member of type 'field' go if the previous member ended at 'offset'?
+static uint32_t layoutPlaceMember(AstType *field, uint32_t offset, BufferLayout L)
+{
+    uint32_t align = layoutAlign(field, L);
+    bool is_vector = field->kind == TYPE_VECTOR;
+    if (is_vector)
+    {
+        uint32_t elem_align = scalarSize(field->vector.elem_type);
+        if (elem_align <= 4) align = elem_align;
+    }
+
+    offset = roundUp(offset, align);
+
+    if (is_vector && improperStraddle(layoutSize(field, L), offset))
+    {
+        offset = roundUp(offset, 16);
+    }
+    return offset;
+}
+
+static uint32_t layoutSize(AstType *t, BufferLayout L)
+{
+    switch (t->kind)
+    {
+    case TYPE_FLOAT:
+    case TYPE_INT:
+    case TYPE_BOOL: return scalarSize(t);
+    case TYPE_VECTOR: return scalarSize(t->vector.elem_type) * t->vector.size;
+    case TYPE_MATRIX: return layoutMatrixStride(t, L) * matrixRowCount(t);
+    case TYPE_ARRAY: return layoutArrayStride(t, L) * (uint32_t)t->array.size;
+    case TYPE_STRUCT: {
+        uint32_t offset = 0;
+        for (uint32_t i = 0; i < t->struct_.field_count; ++i)
+        {
+            AstType *f = t->struct_.fields[i];
+            offset = layoutPlaceMember(f, offset, L);
+            offset += layoutSize(f, L);
+        }
+        return roundUp(offset, layoutAlign(t, L));
+    }
+    default: return 0;
+    }
+}
+
+static IRType *convertTypeToIR(Module *module, IRModule *ir_module, AstType *type);
+
+static IRType *convertTypeToIRLayout(
+    Module *module, IRModule *ir_module, AstType *type, BufferLayout L, char *name_override)
+{
+    if (L == LAYOUT_NONE) return convertTypeToIR(module, ir_module, type);
+
+    TsCompiler *compiler = module->compiler;
+
+    switch (type->kind)
+    {
+    case TYPE_ARRAY: {
+        IRType *size_type = ts__irNewIntType(ir_module, 32, false);
+        IRInst *size = ts__irBuildConstInt(ir_module, size_type, type->array.size);
+        IRType *elem_type = convertTypeToIRLayout(module, ir_module, type->array.sub, L, NULL);
+        return ts__irNewLaidOutArrayType(ir_module, elem_type, size, layoutArrayStride(type, L));
+    }
+
+    case TYPE_STRUCT: {
+        char *name = name_override;
+        if (!name)
+        {
+            ts__sbReset(&compiler->sb);
+            ts__sbSprintf(&compiler->sb, "%s.%s", type->struct_.name,
+                          (L == LAYOUT_STD140) ? "std140" : "std430");
+            name = ts__sbBuild(&compiler->sb, &compiler->alloc);
+        }
+
+        uint32_t field_count = type->struct_.field_count;
+        IRType **field_types = NEW_ARRAY(compiler, IRType *, field_count);
+        IRMemberDecoration *decs = NEW_ARRAY(compiler, IRMemberDecoration, field_count * 3);
+        uint32_t dec_count = 0;
+
+        uint32_t offset = 0;
+        for (uint32_t i = 0; i < field_count; ++i)
+        {
+            AstType *f = type->struct_.fields[i];
+            field_types[i] = convertTypeToIRLayout(module, ir_module, f, L, NULL);
+
+            offset = layoutPlaceMember(f, offset, L);
+            decs[dec_count].kind = SpvDecorationOffset;
+            decs[dec_count].member_index = i;
+            decs[dec_count].value = offset;
+            dec_count++;
+
+            if (f->kind == TYPE_MATRIX)
+            {
+                decs[dec_count].kind = SpvDecorationRowMajor;
+                decs[dec_count].member_index = i;
+                dec_count++;
+                decs[dec_count].kind = SpvDecorationMatrixStride;
+                decs[dec_count].member_index = i;
+                decs[dec_count].value = layoutMatrixStride(f, L);
+                dec_count++;
+            }
+
+            offset += layoutSize(f, L);
+        }
+
+        IRType *struct_type =
+            ts__irNewStructType(ir_module, name, field_types, field_count, decs, dec_count);
+        ts__irSetTypeName(ir_module, struct_type, name);
+        for (uint32_t i = 0; i < field_count; ++i)
+        {
+            ts__irSetMemberName(ir_module, struct_type, i, type->struct_.field_decls[i]->name);
+        }
+        return struct_type;
+    }
+
+    default: return convertTypeToIR(module, ir_module, type);
+    }
+}
+
 static IRType *convertTypeToIR(Module *module, IRModule *ir_module, AstType *type)
 {
     switch (type->kind)
@@ -101,7 +311,8 @@ static IRType *convertTypeToIR(Module *module, IRModule *ir_module, AstType *typ
             &module->compiler->sb, "type.ConstantBuffer.%s", ast_struct_type.struct_.name);
         ast_struct_type.struct_.name = ts__sbBuild(&module->compiler->sb, &module->compiler->alloc);
 
-        IRType *struct_type = convertTypeToIR(module, ir_module, &ast_struct_type);
+        IRType *struct_type = convertTypeToIRLayout(
+            module, ir_module, &ast_struct_type, LAYOUT_STD140, ast_struct_type.struct_.name);
 
         IRDecoration struct_dec = {0};
         struct_dec.kind = SpvDecorationBlock;
@@ -112,15 +323,17 @@ static IRType *convertTypeToIR(Module *module, IRModule *ir_module, AstType *typ
     }
 
     case TYPE_RW_STRUCTURED_BUFFER: {
-        IRType *subtype = convertTypeToIR(module, ir_module, type->buffer.sub);
+        IRType *subtype =
+            convertTypeToIRLayout(module, ir_module, type->buffer.sub, LAYOUT_STD430, NULL);
         IRType *array_type = ts__irNewRuntimeArrayType(ir_module, subtype);
 
         TS_ASSERT(subtype->string);
-        TS_ASSERT(type->buffer.sub->size > 0);
 
         IRDecoration array_dec = {0};
         array_dec.kind = SpvDecorationArrayStride;
-        array_dec.value = type->buffer.sub->size;
+        array_dec.value = roundUp(
+            layoutSize(type->buffer.sub, LAYOUT_STD430),
+            layoutAlign(type->buffer.sub, LAYOUT_STD430));
 
         ts__irDecorateType(ir_module, array_type, &array_dec);
 
@@ -150,15 +363,17 @@ static IRType *convertTypeToIR(Module *module, IRModule *ir_module, AstType *typ
     }
 
     case TYPE_STRUCTURED_BUFFER: {
-        IRType *subtype = convertTypeToIR(module, ir_module, type->buffer.sub);
+        IRType *subtype =
+            convertTypeToIRLayout(module, ir_module, type->buffer.sub, LAYOUT_STD430, NULL);
         IRType *array_type = ts__irNewRuntimeArrayType(ir_module, subtype);
 
         TS_ASSERT(subtype->string);
-        TS_ASSERT(type->buffer.sub->size > 0);
 
         IRDecoration array_dec = {0};
         array_dec.kind = SpvDecorationArrayStride;
-        array_dec.value = type->buffer.sub->size;
+        array_dec.value = roundUp(
+            layoutSize(type->buffer.sub, LAYOUT_STD430),
+            layoutAlign(type->buffer.sub, LAYOUT_STD430));
 
         ts__irDecorateType(ir_module, array_type, &array_dec);
 
@@ -195,28 +410,16 @@ static IRType *convertTypeToIR(Module *module, IRModule *ir_module, AstType *typ
             NEW_ARRAY(module->compiler, IRType *, type->struct_.field_count);
         for (uint32_t i = 0; i < type->struct_.field_count; ++i)
         {
-            AstType *field = type->struct_.fields[i];
-            if (field->kind == TYPE_ARRAY && field->size > 0)
-            {
-                // Struct members get explicit (std140) array layout
-                IRType *size_type = ts__irNewIntType(ir_module, 32, false);
-                IRInst *size = ts__irBuildConstInt(ir_module, size_type, field->array.size);
-                IRType *elem_type = convertTypeToIR(module, ir_module, field->array.sub);
-                field_types[i] = ts__irNewLaidOutArrayType(
-                    ir_module, elem_type, size, field->size / (uint32_t)field->array.size);
-            }
-            else
-            {
-                field_types[i] = convertTypeToIR(module, ir_module, field);
-            }
+            field_types[i] = convertTypeToIR(module, ir_module, type->struct_.fields[i]);
         }
+        // Plain structs (locals, stage I/O) carry no explicit layout
         IRType *struct_type = ts__irNewStructType(
             ir_module,
             type->struct_.name,
             field_types,
             type->struct_.field_count,
-            type->struct_.field_decorations.ptr,
-            arrLength(type->struct_.field_decorations));
+            NULL,
+            0);
 
         ts__irSetTypeName(ir_module, struct_type, type->struct_.name);
 
@@ -1213,6 +1416,11 @@ static void astBuildExpr(Module *ast_mod, IRModule *ir_mod, AstExpr *expr)
                 else
                 {
                     param_values[i] = loadVal(ir_mod, param_values[i]);
+                    // e.g. a constant buffer struct passed to a function taking a plain struct
+                    param_values[i] = ts__irConvertLayout(
+                        ir_mod,
+                        param_values[i],
+                        convertTypeToIR(ast_mod, ir_mod, func_type->func.params[i]));
                 }
             }
 
@@ -1785,7 +1993,10 @@ static void astBuildStmt(Module *ast_mod, IRModule *ir_mod, AstStmt *stmt)
         {
             astBuildExpr(ast_mod, ir_mod, stmt->return_.value);
             TS_ASSERT(stmt->return_.value->value);
-            ts__irBuildReturn(ir_mod, loadVal(ir_mod, stmt->return_.value->value));
+            IRInst *ret = loadVal(ir_mod, stmt->return_.value->value);
+            ret = ts__irConvertLayout(
+                ir_mod, ret, convertTypeToIR(ast_mod, ir_mod, stmt->return_.value->type));
+            ts__irBuildReturn(ir_mod, ret);
         }
         else
         {
@@ -2606,7 +2817,8 @@ void ts__astModuleBuild(Module *ast_mod, IRModule *ir_mod)
 
                 decl->type = new_type;
 
-                ir_type = convertTypeToIR(ast_mod, ir_mod, decl->type);
+                ir_type = convertTypeToIRLayout(
+                    ast_mod, ir_mod, decl->type, LAYOUT_STD430, new_type->struct_.name);
 
                 IRDecoration struct_dec = {0};
                 struct_dec.kind = SpvDecorationBlock;

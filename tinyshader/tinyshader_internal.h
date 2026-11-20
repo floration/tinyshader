@@ -1561,6 +1561,7 @@ void ts__irBuildCondBr(
     IRInst *merge_block,
     IRInst *continue_block);
 void ts__irBuildUnreachable(IRModule *m);
+IRInst *ts__irConvertLayout(IRModule *m, IRInst *value, IRType *dst_type);
 void ts__irBuildSwitch(
     IRModule *m,
     IRInst *selector,

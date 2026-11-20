@@ -441,9 +441,7 @@ static uint32_t typeAlignOf(Module *m, AstType *type)
     case TYPE_STRUCTURED_BUFFER: align = typeAlignOf(m, type->buffer.sub); break;
     case TYPE_RW_STRUCTURED_BUFFER: align = typeAlignOf(m, type->buffer.sub); break;
 
-    // Arrays use the std140 rule (elements on 16-byte boundaries), matching
-    // DXC's constant buffer layout
-    case TYPE_ARRAY: align = padToAlignment(typeAlignOf(m, type->array.sub), 16); break;
+    case TYPE_ARRAY: align = typeAlignOf(m, type->array.sub); break;
 
     case TYPE_VECTOR: {
         switch (type->vector.size)
@@ -506,9 +504,7 @@ static uint32_t typeSizeOf(Module *m, AstType *type)
     case TYPE_STRUCTURED_BUFFER: size = typeSizeOf(m, type->buffer.sub); break;
     case TYPE_RW_STRUCTURED_BUFFER: size = typeSizeOf(m, type->buffer.sub); break;
 
-    case TYPE_ARRAY:
-        size = padToAlignment(typeSizeOf(m, type->array.sub), 16) * type->array.size;
-        break;
+    case TYPE_ARRAY: size = typeSizeOf(m, type->array.sub) * type->array.size; break;
 
     case TYPE_VECTOR: {
         switch (type->vector.size)

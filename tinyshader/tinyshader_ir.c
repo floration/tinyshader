@@ -964,28 +964,47 @@ IRInst *ts__irBuildAlloca(IRModule *m, IRType *type)
     return inst;
 }
 
-// Rebuilds an array value as an equivalent array type that differs only in
-// explicit layout (ArrayStride), element by element.
-static IRInst *irConvertArrayLayout(IRModule *m, IRInst *value, IRType *dst_type)
+// Rebuilds a composite value as an equivalent type that differs only in
+// explicit layout (e.g. a struct loaded from a constant buffer being stored
+// into a local), member by member. SPIR-V 1.3 has no OpCopyLogical.
+static IRInst *irConvertLayout(IRModule *m, IRInst *value, IRType *dst_type)
 {
     IRType *src_type = value->type;
-    if (src_type == dst_type) return value;
-    if (src_type->kind != IR_TYPE_ARRAY || dst_type->kind != IR_TYPE_ARRAY) return value;
-    if (src_type->array.size != dst_type->array.size) return value;
+    if (!src_type || src_type == dst_type) return value;
 
-    IRInst *size = src_type->array.size;
     uint32_t count = 0;
-    memcpy(&count, size->constant.value,
-           size->constant.value_size_bytes < 4 ? size->constant.value_size_bytes : 4);
+    if (src_type->kind == IR_TYPE_ARRAY && dst_type->kind == IR_TYPE_ARRAY &&
+        src_type->array.size == dst_type->array.size)
+    {
+        IRInst *size = src_type->array.size;
+        memcpy(&count, size->constant.value,
+               size->constant.value_size_bytes < 4 ? size->constant.value_size_bytes : 4);
+    }
+    else if (src_type->kind == IR_TYPE_STRUCT && dst_type->kind == IR_TYPE_STRUCT &&
+             src_type->struct_.field_count == dst_type->struct_.field_count)
+    {
+        count = src_type->struct_.field_count;
+    }
+    else
+    {
+        return value;
+    }
 
     IRInst **elems = NEW_ARRAY(m->compiler, IRInst *, count);
     for (uint32_t i = 0; i < count; ++i)
     {
         uint32_t index = i;
         IRInst *elem = ts__irBuildCompositeExtract(m, value, &index, 1);
-        elems[i] = irConvertArrayLayout(m, elem, dst_type->array.sub);
+        IRType *dst_elem = (dst_type->kind == IR_TYPE_ARRAY) ? dst_type->array.sub
+                                                             : dst_type->struct_.fields[i];
+        elems[i] = irConvertLayout(m, elem, dst_elem);
     }
     return ts__irBuildCompositeConstruct(m, dst_type, elems, count);
+}
+
+IRInst *ts__irConvertLayout(IRModule *m, IRInst *value, IRType *dst_type)
+{
+    return irConvertLayout(m, value, dst_type);
 }
 
 void ts__irBuildStore(IRModule *m, IRInst *pointer, IRInst *value)
@@ -995,7 +1014,7 @@ void ts__irBuildStore(IRModule *m, IRInst *pointer, IRInst *value)
 
     if (pointer->type && pointer->type->kind == IR_TYPE_POINTER && value->type)
     {
-        value = irConvertArrayLayout(m, value, pointer->type->ptr.sub);
+        value = irConvertLayout(m, value, pointer->type->ptr.sub);
     }
 
     IRInst *inst = NEW(m->compiler, IRInst);

@@ -5,7 +5,7 @@ Needs dxc, spirv-val and spirv-opt on PATH (all ship with the Vulkan SDK).
 Usage: python tests/run_tests.py [--no-dxc] [--no-opt] [filter]
 """
 
-import os, shutil, subprocess, sys
+import os, re, shutil, subprocess, sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 os.chdir(ROOT)
@@ -15,7 +15,7 @@ use_dxc = "--no-dxc" not in sys.argv
 use_opt = "--no-opt" not in sys.argv
 name_filter = args[0] if args else ""
 
-for tool in (["spirv-val"] + (["dxc"] if use_dxc else []) + (["spirv-opt"] if use_opt else [])):
+for tool in (["spirv-val", "spirv-dis"] + (["dxc"] if use_dxc else []) + (["spirv-opt"] if use_opt else [])):
     if not shutil.which(tool):
         sys.exit(f"error: '{tool}' not found on PATH (install the Vulkan SDK)")
 
@@ -34,6 +34,17 @@ if not compiler_exe:
 
 STAGES = {".frag": ("fragment", "ps_6_0"), ".vert": ("vertex", "vs_6_0"), ".comp": ("compute", "cs_6_0")}
 TARGET_ENV = "vulkan1.1"
+
+def layout_facts(spv):
+    """Member offsets / matrix strides by member name, and array strides."""
+    ok, dis = run(["spirv-dis", spv])
+    if not ok:
+        return {}
+    names = {(i, int(k)): n for i, k, n in re.findall(r'OpMemberName (%\S+) (\d+) "([^"]*)"', dis)}
+    facts = {}
+    for i, k, what, v in re.findall(r'OpMemberDecorate (%\S+) (\d+) (Offset|MatrixStride) (\d+)', dis):
+        facts[(names.get((i, int(k)), "?"), what)] = int(v)
+    return facts
 
 def run(cmd):
     r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -79,6 +90,15 @@ def test_dir(dir, expect_ok):
             dxc_out = os.path.join(outdir, base + ".dxc.spv")
             ok_dxc, log = run(["dxc", src, "-E", "main", "-T", dxc_profile, "-spirv",
                                "-fspv-target-env=" + TARGET_ENV, "-Fo", dxc_out])
+            if ok_dxc and ok and expect_ok:
+                # Buffer layout must match DXC's, or CPU-side data won't line up.
+                # Only members DXC kept (it strips unused resources) are compared.
+                ours, theirs = layout_facts(out), layout_facts(dxc_out)
+                diffs = [f"{n}.{w}: tinyshader={ours.get((n, w))} dxc={v}"
+                         for (n, w), v in sorted(theirs.items())
+                         if (n, w) in ours and ours[(n, w)] != v]
+                if diffs:
+                    problems.append(("buffer layout differs from DXC", "\n".join(diffs)))
             if ok_dxc != expect_ok:
                 # Disagreement with DXC is worth knowing about, but it is the
                 # reference, so report it separately rather than as our failure.
