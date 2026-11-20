@@ -1160,6 +1160,63 @@ static AstStmt *parseStmt(Parser *p)
         return stmt;
     }
 
+    case TOKEN_SWITCH: {
+        Location stmt_loc = parserBeginLoc(p);
+
+        parserNext(p, 1);
+        AstStmt *stmt = NEW(compiler, AstStmt);
+        stmt->kind = STMT_SWITCH;
+
+        if (!parserConsume(p, TOKEN_LPAREN)) return NULL;
+        stmt->switch_.selector = parseExpr(p);
+        if (!stmt->switch_.selector) return NULL;
+        if (!parserConsume(p, TOKEN_RPAREN)) return NULL;
+
+        Location body_loc = parserBeginLoc(p);
+        if (!parserConsume(p, TOKEN_LCURLY)) return NULL;
+
+        AstStmt *body = NEW(compiler, AstStmt);
+        body->kind = STMT_BLOCK;
+
+        while (!parserIsAtEnd(p) && parserPeek(p, 0)->kind != TOKEN_RCURLY)
+        {
+            TokenKind kind = parserPeek(p, 0)->kind;
+            if (kind == TOKEN_CASE || kind == TOKEN_DEFAULT)
+            {
+                parserNext(p, 1);
+
+                AstSwitchLabel label = {0};
+                label.stmt_index = (uint32_t)body->block.stmts.len;
+                if (kind == TOKEN_CASE)
+                {
+                    label.value = parseExpr(p);
+                    if (!label.value) return NULL;
+                }
+                if (!parserConsume(p, TOKEN_COLON)) return NULL;
+
+                arrPush(compiler, &stmt->switch_.labels, label);
+                continue;
+            }
+
+            AstStmt *sub_stmt = parseStmt(p);
+            if (sub_stmt)
+            {
+                arrPush(compiler, &body->block.stmts, sub_stmt);
+            }
+        }
+
+        if (!parserConsume(p, TOKEN_RCURLY)) return NULL;
+
+        parserEndLoc(p, &body_loc);
+        body->loc = body_loc;
+        stmt->switch_.body = body;
+
+        parserEndLoc(p, &stmt_loc);
+        stmt->loc = stmt_loc;
+
+        return stmt;
+    }
+
     case TOKEN_WHILE: {
         Location stmt_loc = parserBeginLoc(p);
 

@@ -476,6 +476,7 @@ typedef enum IRInstKind {
     IR_INST_FUNC_CALL,
     IR_INST_BRANCH,
     IR_INST_COND_BRANCH,
+    IR_INST_SWITCH,
 
     IR_INST_BUILTIN_CALL,
     IR_INST_BARRIER,
@@ -743,6 +744,16 @@ struct IRInst
             IRInst *merge_block;
             IRInst *continue_block;
         } cond_branch;
+
+        struct
+        {
+            IRInst *selector;
+            IRInst *default_block;
+            IRInst *merge_block;
+            uint32_t case_count;
+            uint32_t *literals;
+            IRInst **blocks;
+        } switch_;
 
         struct
         {
@@ -1052,6 +1063,7 @@ typedef enum AstStmtKind {
     STMT_WHILE,
     STMT_DO_WHILE,
     STMT_FOR,
+    STMT_SWITCH,
 } AstStmtKind;
 
 typedef enum AstDeclKind {
@@ -1083,6 +1095,13 @@ typedef enum AstExprKind {
     EXPR_RUNTIME_ARRAY_TYPE,
     EXPR_COMPOSITE_LITERAL,
 } AstExprKind;
+
+typedef struct AstSwitchLabel
+{
+    uint32_t stmt_index; // index into the switch body where this label points
+    AstExpr *value;      // NULL for 'default'
+} AstSwitchLabel;
+typedef ARRAY_OF(AstSwitchLabel) ArrayOfAstSwitchLabel;
 
 struct AstStmt
 {
@@ -1131,6 +1150,13 @@ struct AstStmt
 
             AstStmt *stmt;
         } for_;
+
+        struct
+        {
+            AstExpr *selector;
+            AstStmt *body; // STMT_BLOCK holding every statement of the switch
+            ArrayOfAstSwitchLabel labels;
+        } switch_;
     };
 };
 
@@ -1531,6 +1557,14 @@ void ts__irBuildCondBr(
     IRInst *false_block,
     IRInst *merge_block,
     IRInst *continue_block);
+void ts__irBuildSwitch(
+    IRModule *m,
+    IRInst *selector,
+    IRInst *default_block,
+    IRInst *merge_block,
+    uint32_t case_count,
+    uint32_t *literals,
+    IRInst **blocks);
 
 uint32_t *ts__irModuleCodegen(IRModule *mod, size_t *word_count);
 

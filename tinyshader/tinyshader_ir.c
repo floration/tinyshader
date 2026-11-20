@@ -656,6 +656,7 @@ bool ts__irBlockHasTerminator(IRInst *block)
     switch (last_inst->kind)
     {
     case IR_INST_COND_BRANCH:
+    case IR_INST_SWITCH:
     case IR_INST_BRANCH:
     case IR_INST_DISCARD:
     case IR_INST_RETURN: return true;
@@ -1371,6 +1372,28 @@ void ts__irBuildCondBr(
     arrPush(m->compiler, &block->block.insts, inst);
 }
 
+void ts__irBuildSwitch(
+    IRModule *m,
+    IRInst *selector,
+    IRInst *default_block,
+    IRInst *merge_block,
+    uint32_t case_count,
+    uint32_t *literals,
+    IRInst **blocks)
+{
+    IRInst *inst = NEW(m->compiler, IRInst);
+    inst->kind = IR_INST_SWITCH;
+    inst->switch_.selector = selector;
+    inst->switch_.default_block = default_block;
+    inst->switch_.merge_block = merge_block;
+    inst->switch_.case_count = case_count;
+    inst->switch_.literals = literals;
+    inst->switch_.blocks = blocks;
+
+    IRInst *block = ts__irGetCurrentBlock(m);
+    arrPush(m->compiler, &block->block.insts, inst);
+}
+
 ////////////////////////////////
 //
 // IR instruction encoding
@@ -1851,6 +1874,28 @@ static void irModuleEncodeBlock(IRModule *m, IRInst *block)
                 };
                 irModuleEncodeInst(m, SpvOpBranchConditional, params, 3);
             }
+            break;
+        }
+
+        case IR_INST_SWITCH: {
+            {
+                uint32_t params[2] = {
+                    inst->switch_.merge_block->id,
+                    SpvSelectionControlMaskNone,
+                };
+                irModuleEncodeInst(m, SpvOpSelectionMerge, params, 2);
+            }
+
+            uint32_t param_count = 2 + inst->switch_.case_count * 2;
+            uint32_t *params = NEW_ARRAY(m->compiler, uint32_t, param_count);
+            params[0] = inst->switch_.selector->id;
+            params[1] = inst->switch_.default_block->id;
+            for (uint32_t i = 0; i < inst->switch_.case_count; ++i)
+            {
+                params[2 + i * 2] = inst->switch_.literals[i];
+                params[2 + i * 2 + 1] = inst->switch_.blocks[i]->id;
+            }
+            irModuleEncodeInst(m, SpvOpSwitch, params, param_count);
             break;
         }
 

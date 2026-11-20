@@ -4252,6 +4252,68 @@ static void analyzerAnalyzeStmt(Analyzer *a, AstStmt *stmt)
         break;
     }
 
+    case STMT_SWITCH: {
+        AstExpr *sel = stmt->switch_.selector;
+        analyzerAnalyzeExpr(a, sel, NULL);
+        if (sel->type && sel->type->kind != TYPE_INT)
+        {
+            // HLSL allows any scalar selector convertible to int
+            if (ts__getScalarTypeNoVec(sel->type))
+            {
+                wrapAutoCast(a, sel, newIntType(a->module, 32, true));
+            }
+            else
+            {
+                ts__addErr(compiler, &sel->loc, "switch selector must be a scalar integer");
+            }
+        }
+
+        bool seen_default = false;
+        for (uint32_t i = 0; i < arrLength(stmt->switch_.labels); ++i)
+        {
+            AstSwitchLabel *label = &stmt->switch_.labels.ptr[i];
+            if (!label->value)
+            {
+                if (seen_default)
+                {
+                    ts__addErr(compiler, &stmt->loc, "multiple default labels in switch");
+                }
+                seen_default = true;
+                continue;
+            }
+
+            analyzerAnalyzeExpr(a, label->value, NULL);
+            if (!label->value->resolved_int)
+            {
+                ts__addErr(
+                    compiler, &label->value->loc, "case label must be an integer constant");
+                continue;
+            }
+
+            for (uint32_t j = 0; j < i; ++j)
+            {
+                AstSwitchLabel *other = &stmt->switch_.labels.ptr[j];
+                if (other->value && other->value->resolved_int &&
+                    *other->value->resolved_int == *label->value->resolved_int)
+                {
+                    ts__addErr(compiler, &label->value->loc, "duplicate case label");
+                }
+            }
+        }
+
+        if (arrLength(stmt->switch_.body->block.stmts) > 0 &&
+            (arrLength(stmt->switch_.labels) == 0 ||
+             stmt->switch_.labels.ptr[0].stmt_index > 0))
+        {
+            ts__addErr(compiler, &stmt->loc, "statement in switch before any case label");
+        }
+
+        arrPush(a->compiler, &a->break_stack, stmt);
+        analyzerAnalyzeStmt(a, stmt->switch_.body);
+        arrPop(&a->break_stack);
+        break;
+    }
+
     case STMT_WHILE: {
         analyzerAnalyzeExpr(a, stmt->while_.cond, NULL);
         if (stmt->while_.cond->type && !ts__getComparableType(stmt->while_.cond->type))

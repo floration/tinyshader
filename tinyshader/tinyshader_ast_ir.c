@@ -1868,6 +1868,91 @@ static void astBuildStmt(Module *ast_mod, IRModule *ir_mod, AstStmt *stmt)
         break;
     }
 
+    case STMT_SWITCH: {
+        astBuildExpr(ast_mod, ir_mod, stmt->switch_.selector);
+        IRInst *selector = loadVal(ir_mod, stmt->switch_.selector->value);
+
+        IRInst *current_block = ts__irGetCurrentBlock(ir_mod);
+        IRInst *func = current_block->block.func;
+
+        ArrayOfAstStmtPtr stmts = stmt->switch_.body->block.stmts;
+        ArrayOfAstSwitchLabel labels = stmt->switch_.labels;
+        uint32_t stmt_count = (uint32_t)stmts.len;
+
+        // One block per distinct label position, in source order.
+        // section_block[i] is the block starting at statement i (or NULL).
+        IRInst **section_block = NEW_ARRAY(compiler, IRInst *, stmt_count + 1);
+        IRInst *merge_block = NULL;
+        IRInst *default_block = NULL;
+
+        for (uint32_t i = 0; i < labels.len; ++i)
+        {
+            uint32_t idx = labels.ptr[i].stmt_index;
+            if (!section_block[idx]) section_block[idx] = ts__irCreateBlock(ir_mod, func);
+        }
+        merge_block = ts__irCreateBlock(ir_mod, func);
+
+        // A label after the last statement just falls through to the merge
+        if (section_block[stmt_count])
+        {
+            section_block[stmt_count] = merge_block;
+        }
+
+        uint32_t case_count = 0;
+        uint32_t *literals = NEW_ARRAY(compiler, uint32_t, labels.len + 1);
+        IRInst **targets = NEW_ARRAY(compiler, IRInst *, labels.len + 1);
+        for (uint32_t i = 0; i < labels.len; ++i)
+        {
+            IRInst *target = section_block[labels.ptr[i].stmt_index];
+            if (!labels.ptr[i].value)
+            {
+                default_block = target;
+                continue;
+            }
+            literals[case_count] = (uint32_t)(int32_t)*labels.ptr[i].value->resolved_int;
+            targets[case_count] = target;
+            case_count++;
+        }
+        if (!default_block) default_block = merge_block;
+
+        ts__irBuildSwitch(
+            ir_mod, selector, default_block, merge_block, case_count, literals, targets);
+
+        arrPush(compiler, &ast_mod->break_stack, merge_block);
+
+        bool positioned = false;
+        for (uint32_t i = 0; i < stmt_count; ++i)
+        {
+            if (section_block[i])
+            {
+                // Fall through from the previous section if it didn't terminate
+                if (positioned && !ts__irBlockHasTerminator(ts__irGetCurrentBlock(ir_mod)))
+                {
+                    ts__irBuildBr(ir_mod, section_block[i], NULL, NULL);
+                }
+                ts__irPositionAtEnd(ir_mod, section_block[i]);
+                ts__irAddBlock(ir_mod, section_block[i]);
+                positioned = true;
+            }
+
+            if (!positioned) continue;
+            if (ts__irBlockHasTerminator(ts__irGetCurrentBlock(ir_mod))) continue;
+
+            astBuildStmt(ast_mod, ir_mod, stmts.ptr[i]);
+        }
+
+        if (positioned && !ts__irBlockHasTerminator(ts__irGetCurrentBlock(ir_mod)))
+        {
+            ts__irBuildBr(ir_mod, merge_block, NULL, NULL);
+        }
+
+        arrPop(&ast_mod->break_stack);
+
+        ts__irPositionAtEnd(ir_mod, merge_block);
+        ts__irAddBlock(ir_mod, merge_block);
+        break;
+    }
+
     case STMT_WHILE: {
         IRInst *current_block = ts__irGetCurrentBlock(ir_mod);
         IRInst *func = current_block->block.func;
